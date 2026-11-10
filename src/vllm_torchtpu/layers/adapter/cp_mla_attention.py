@@ -58,10 +58,10 @@ def _get_tp_group() -> Any | None:
 
 def _get_head_group() -> Any | None:
     """The group whose ranks hold distinct query head slices: TP when the
-    PCP manager's DCP spans TP x PCP, else DCP."""
+    head-tail PCP manager's DCP spans TP x PCP, else DCP."""
     # From the flag, not the group sizes: looking a group up can fail an
     # assert, which `torch.compile` cannot trace.
-    return _get_tp_group() if envs.USE_TPU_PCP_MANAGER else get_dcp_group()
+    return _get_tp_group() if envs.use_headtail_pcp_manager() else get_dcp_group()
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -150,7 +150,7 @@ def merge_lse_partials_scatter_heads(
     # bucket; comparing its token count would pin that graph to the first
     # size traced. `is_backbone` is checked before the token count, so the
     # drafter never compares it.
-    spans_pcp = envs.USE_TPU_PCP_MANAGER
+    spans_pcp = envs.use_headtail_pcp_manager()
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
         and not spans_pcp
