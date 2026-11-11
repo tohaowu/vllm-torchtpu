@@ -25,6 +25,7 @@ WRAPPED_LANES_PER_AXIS: int = 2
 DEFAULT_ICI_LINK_BW: float = 100.0e9
 DEFAULT_ICI_BW: float = 300.0e9
 DEFAULT_ICI_HOP_LATENCY_S: float = 1.0e-6
+DEFAULT_MXU_M_TILE: int = 256
 TPU7X_ICI_LINKS_PER_CHIP: int = 6
 TPU7X_ICI_BIDIR_LINK_BW: float = 200.0e9
 
@@ -82,6 +83,7 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
         "moe",
         "mtp",
         "ple",
+        "ffn_only",
     }
 )
 
@@ -109,6 +111,7 @@ NON_FULL_ATTN_TOKENS: frozenset[str] = frozenset(
         "kda",
         "kimi_linear",
         "kda_attention",
+        "ffn_only",
     }
 )
 
@@ -215,3 +218,37 @@ MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
 # Self-contained HTML report constants.
 MAX_EMBEDDED_CANDIDATES: int = 2000
 MIN_FRONTIER_POINTS_FOR_POLYLINE: int = 2
+
+# Config architecture validation, hybrid patterns, and step cache constants.
+UNSUPPORTED_SSM_MODEL_TYPES: frozenset[str] = frozenset(
+    {
+        "mamba",
+        "mamba2",
+        "rwkv",
+        "rwkv6",
+        "falcon_mamba",
+        "xlstm",
+        "retnet",
+        "hyena",
+        "stripedhyena",
+    }
+)
+UNSUPPORTED_NON_CAUSAL_TYPES: frozenset[str] = frozenset(
+    {"bert", "roberta", "t5", "whisper", "vit", "clip", "dit", "flux", "sdxl"}
+)
+MULTIMODAL_KEYS: tuple[str, ...] = (
+    "vision_config",
+    "audio_config",
+    "video_config",
+    "mm_projector_type",
+    "image_token_index",
+)
+HYBRID_PATTERN_MAP: dict[str, str] = {
+    "*": "full_attention",
+    "M": "linear_attention",
+    "-": "ffn_only",
+    "E": "ffn_only",
+}
+STEP_FLOOR_CACHE_MAXSIZE: int = 32768
+UNIT_COLL_CACHE_MAXSIZE: int = 32768
+BLOCK_PARALLEL_ENABLED: int = 2

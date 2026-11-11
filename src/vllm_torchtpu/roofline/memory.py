@@ -59,6 +59,9 @@ class LayerCounts:
     dsa: int = 0
     gdn: int = 0
     kda: int = 0
+    eff_gqa: float = 0.0
+    eff_swa: float = 0.0
+    eff_mla: float = 0.0
 
     @property
     def attn_total(self) -> int:
@@ -90,22 +93,38 @@ class KvFitInput:
 
 
 def count_layer_types(geom: ModelGeometry) -> LayerCounts:
-    """Count occurrences of attention and recurrent layer types in model geometry."""
+    """Count occurrences of attention/recurrent layers and KV retention weights."""
     counts = {"gqa": 0, "swa": 0, "mla": 0, "dsa": 0, "gdn": 0, "kda": 0}
-    for tok in geom.layer_types:
+    kv_sums = {"gqa": 0.0, "swa": 0.0, "mla": 0.0}
+    n_cr = len(geom.compress_ratios)
+    for idx, tok in enumerate(geom.layer_types):
+        if tok == "ffn_only":
+            continue
+        r_i = geom.compress_ratios[idx] if idx < n_cr else 1.0
+        kv_ret = (1.0 / r_i) if r_i > 1.0 else r_i
         mapped = LAYER_TYPE_MAP.get(tok)
         if mapped == "dsa":
             counts["mla"] += 1
             counts["dsa"] += 1
+            kv_sums["mla"] += kv_ret
         elif mapped is not None and mapped != "gqa":
             counts[mapped] += 1
+            if mapped in kv_sums:
+                kv_sums[mapped] += kv_ret
         elif geom.kv_lora_rank > 0:
             counts["mla"] += 1
+            kv_sums["mla"] += kv_ret
             if geom.index_topk > 0:
                 counts["dsa"] += 1
         else:
             counts["gqa"] += 1
-    return LayerCounts(**counts)
+            kv_sums["gqa"] += kv_ret
+    return LayerCounts(
+        **counts,
+        eff_gqa=kv_sums["gqa"] if geom.compress_ratios else float(counts["gqa"]),
+        eff_swa=kv_sums["swa"] if geom.compress_ratios else float(counts["swa"]),
+        eff_mla=kv_sums["mla"] if geom.compress_ratios else float(counts["mla"]),
+    )
 
 
 def _compute_mla_w_attn(
@@ -122,7 +141,7 @@ def _compute_mla_w_attn(
     if geom.qk_nope_head_dim <= 0:
         msg = "MLA layer requires config field 'qk_nope_head_dim'"
         raise ValueError(msg)
-    if geom.qk_rope_head_dim <= 0:
+    if geom.qk_rope_head_dim < 0:
         msg = "MLA layer requires config field 'qk_rope_head_dim'"
         raise ValueError(msg)
     kv_lora = geom.kv_lora_rank
@@ -177,20 +196,22 @@ def compute_w_attn(
     q_mult = 2 if geom.attn_output_gate else 1
     kv_div = min(tp, max(1, geom.num_kv_heads))
     w_attn = 0.0
-    n_gqa_swa = counts.gqa + counts.swa
-    if n_gqa_swa > 0:
+    gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
+    for n_layers, hd in ((counts.gqa, gqa_hd), (counts.swa, geom.head_dim)):
+        if n_layers <= 0:
+            continue
         w_q_o = (
-            float(n_gqa_swa)
+            float(n_layers)
             * float(
-                geom.hidden * geom.num_heads * geom.head_dim * q_mult
-                + geom.num_heads * geom.head_dim * geom.hidden
+                geom.hidden * geom.num_heads * hd * q_mult
+                + geom.num_heads * hd * geom.hidden
             )
             * dt.w_dense
             / (tp * pp)
         )
         w_kv = (
-            float(n_gqa_swa)
-            * float(2 * geom.hidden * geom.num_kv_heads * geom.head_dim)
+            float(n_layers)
+            * float(2 * geom.hidden * geom.num_kv_heads * hd)
             * dt.w_dense
             / (kv_div * pp)
         )
@@ -248,16 +269,15 @@ def compute_w_ffn(
     ep = par.ep if (par.moe == "ep" and par.ep > 1) else (tp if par.moe == "ep" else 1)
     w_ffn = 0.0
     w_dense_ffn = 0.0
-    if geom.num_experts > 0:
-        n_dense_ffn = min(geom.num_layers, geom.first_k_dense_replace)
-        n_moe_ffn = geom.num_layers - n_dense_ffn
-        if n_dense_ffn > 0 and geom.dense_inter > 0:
-            w_dense_ffn = (
-                float(n_dense_ffn * GLU_MATMUL_COUNT * geom.hidden * geom.dense_inter)
-                * dt.w_dense
-                / (tp * pp)
-            )
-            w_ffn += w_dense_ffn
+    n_moe_ffn, n_dense_ffn = geom.ffn_layer_counts()
+    if n_dense_ffn > 0 and geom.dense_inter > 0:
+        w_dense_ffn = (
+            float(n_dense_ffn * GLU_MATMUL_COUNT * geom.hidden * geom.dense_inter)
+            * dt.w_dense
+            / (tp * pp)
+        )
+        w_ffn += w_dense_ffn
+    if n_moe_ffn > 0:
         routed_div = ep * pp if par.moe == "ep" else tp * pp
         w_ffn += (
             float(
@@ -282,12 +302,6 @@ def compute_w_ffn(
                 / pp
             )
         w_ffn += float(n_moe_ffn * geom.hidden * geom.num_experts) * dt.router / pp
-    else:
-        w_ffn += (
-            float(geom.num_layers * GLU_MATMUL_COUNT * geom.hidden * geom.dense_inter)
-            * dt.w_dense
-            / (tp * pp)
-        )
     return w_ffn, w_dense_ffn
 
 
@@ -307,15 +321,38 @@ def _compute_w_mtp(
     w_ffn, w_dense_ffn = w_ffn_terms
     mtp_fc = float(2 * geom.hidden * geom.hidden) * dt.w_aux / tp
     mtp_att = (w_attn / float(max(1, n_attn_total))) * float(pp)
-    if geom.num_experts > 0:
-        n_moe_layers = max(
-            1,
-            geom.num_layers - min(geom.num_layers, geom.first_k_dense_replace),
+    if geom.mtp_inter > 0:
+        mtp_ffn = (
+            float(GLU_MATMUL_COUNT * geom.hidden * geom.mtp_inter) * dt.w_dense / tp
         )
+    elif geom.num_experts > 0:
+        n_moe_ffn, _ = geom.ffn_layer_counts()
+        n_moe_layers = max(1, n_moe_ffn)
         mtp_ffn = ((w_ffn - w_dense_ffn) / float(n_moe_layers)) * float(pp)
     else:
         mtp_ffn = (w_ffn / float(max(1, geom.num_layers))) * float(pp)
     return float(geom.mtp_layers) * (mtp_fc + mtp_att + mtp_ffn) / float(pp)
+
+
+def _gqa_kv_bytes_per_tok(
+    head_dim: int,
+    kvh: int,
+    kv_packing: int,
+    kv_bytes: float,
+    *,
+    physical_kv_layout: bool,
+) -> float:
+    """Compute KV bytes per token for one GQA/SWA attention head geometry."""
+    if not physical_kv_layout:
+        return float(2 * kvh * head_dim) * kv_bytes
+    padded_hd = (
+        math.ceil(head_dim / PHYSICAL_ALIGNMENT_ELEMS) * PHYSICAL_ALIGNMENT_ELEMS
+        if head_dim > 0
+        else 0
+    )
+    kx2 = kvh if head_dim == HEAD_DIM_PACKING_THRESHOLD else 2 * kvh
+    padded_kx2 = math.ceil(kx2 / kv_packing) * kv_packing if kx2 > 0 else 0
+    return float(padded_kx2 * padded_hd) * kv_bytes
 
 
 def _compute_kv_and_state(
@@ -333,24 +370,24 @@ def _compute_kv_and_state(
         if geom.kv_lora_rank <= 0:
             msg = "MLA layer requires config field 'kv_lora_rank'"
             raise ValueError(msg)
-        if geom.qk_rope_head_dim <= 0:
+        if geom.qk_rope_head_dim < 0:
             msg = "MLA layer requires config field 'qk_rope_head_dim'"
             raise ValueError(msg)
     raw_latent_w = geom.kv_lora_rank + geom.qk_rope_head_dim
+    gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
+    swa_hd = geom.head_dim
+    kv_packing = (
+        max(1, round(HBM_PACKING_NUMERATOR / max(HBM_MIN_PACKING_DIVISOR, dt.kv)))
+        if layout.physical_kv_layout
+        else 1
+    )
+    gqa_kv_b_per_tok = _gqa_kv_bytes_per_tok(
+        gqa_hd, kvh, kv_packing, dt.kv, physical_kv_layout=layout.physical_kv_layout
+    )
+    swa_kv_b_per_tok = _gqa_kv_bytes_per_tok(
+        swa_hd, kvh, kv_packing, dt.kv, physical_kv_layout=layout.physical_kv_layout
+    )
     if layout.physical_kv_layout:
-        kv_packing = max(
-            1,
-            round(HBM_PACKING_NUMERATOR / max(HBM_MIN_PACKING_DIVISOR, dt.kv)),
-        )
-        padded_hd = (
-            math.ceil(geom.head_dim / PHYSICAL_ALIGNMENT_ELEMS)
-            * PHYSICAL_ALIGNMENT_ELEMS
-            if geom.head_dim > 0
-            else 0
-        )
-        kx2 = kvh if geom.head_dim == HEAD_DIM_PACKING_THRESHOLD else 2 * kvh
-        padded_kx2 = math.ceil(kx2 / kv_packing) * kv_packing if kx2 > 0 else 0
-        gqa_kv_b_per_tok = float(padded_kx2 * padded_hd) * dt.kv
         mla_latent_b = (
             float(
                 math.ceil(raw_latent_w / PHYSICAL_ALIGNMENT_ELEMS)
@@ -365,7 +402,6 @@ def _compute_kv_and_state(
             else 0.0
         )
     else:
-        gqa_kv_b_per_tok = float(2 * kvh * geom.head_dim) * dt.kv
         mla_latent_b = float(raw_latent_w) * dt.kv
         dsa_idx_b = (
             float(geom.index_head_dim) * dt.kv
@@ -373,15 +409,19 @@ def _compute_kv_and_state(
             else 0.0
         )
     kv_div = par.kv_split * par.pcp * pp
-    kv_gqa = float(layout.seqs_per_dp * counts.gqa * layout.context) * gqa_kv_b_per_tok
+    kv_gqa = (
+        float(layout.seqs_per_dp * layout.context) * counts.eff_gqa * gqa_kv_b_per_tok
+    )
     eff_swa_ctx = (
         min(layout.context, geom.sliding_window)
         if geom.sliding_window > 0
         else layout.context
     )
-    kv_swa = float(layout.seqs_per_dp * counts.swa * eff_swa_ctx) * gqa_kv_b_per_tok
-    kv_mla = float(layout.seqs_per_dp * counts.mla * layout.context) * (
-        mla_latent_b + dsa_idx_b
+    kv_swa = float(layout.seqs_per_dp * eff_swa_ctx) * counts.eff_swa * swa_kv_b_per_tok
+    kv_mla = (
+        float(layout.seqs_per_dp * layout.context)
+        * counts.eff_mla
+        * (mla_latent_b + dsa_idx_b)
     )
     kv_bytes = (kv_gqa + kv_swa + kv_mla) / kv_div
 

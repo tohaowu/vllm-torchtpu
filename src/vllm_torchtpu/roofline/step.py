@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from .collectives import (
@@ -26,7 +27,12 @@ from .collectives import (
     submesh_for_group,
     torus_collective_s,
 )
-from .constants import ACTIVATION_BYTES_BF16, MATMUL_FLOP_PER_MAC
+from .constants import (
+    ACTIVATION_BYTES_BF16,
+    MATMUL_FLOP_PER_MAC,
+    STEP_FLOOR_CACHE_MAXSIZE,
+    UNIT_COLL_CACHE_MAXSIZE,
+)
 from .geometry import ModelGeometry
 from .modules import (
     Dtypes,
@@ -39,6 +45,9 @@ from .modules import (
 
 if TYPE_CHECKING:
     from .chips import ChipSpec, SliceTopology
+    from .collectives import Collective
+
+type _CollKey = tuple[str, float, int, float, float, int]
 
 
 @dataclass(frozen=True)
@@ -84,26 +93,16 @@ class StepFloor:
         return self.lat_s
 
 
-def _combine_modules(
-    modules: tuple[ModuleCost, ...],
+@lru_cache(maxsize=UNIT_COLL_CACHE_MAXSIZE)
+def _unit_coll_times(
+    c: Collective,
+    topology: SliceTopology | None,
+    ranks_per_chip: int,
+    c_axes: tuple[int, int, int, int] | None,
     chip: ChipSpec,
-    collective_latency_s: float = 0.0,
-    *,
-    topology: SliceTopology | None = None,
-    par: Parallel | None = None,
-) -> StepFloor:
-    """Combine per-module resource costs into a StepFloor summary."""
-    hbm_s = sum(m.hbm_bytes for m in modules) / chip.hbm_bw
-    mm_s = (
-        sum(m.fp8_flops for m in modules) / chip.fp8_flops
-        + sum(m.bf16_flops for m in modules) / chip.bf16_flops
-    )
+) -> tuple[float, float]:
+    """Compute per-hop latency and analytic collective duration for one collective."""
     has_finite_ici = chip.ici_bw > 0.0 and math.isfinite(chip.ici_bw)
-    ici_s = sum(m.ici_bytes for m in modules) / chip.ici_bw if has_finite_ici else 0.0
-    mesh_axes = par.mesh_axes if par is not None else None
-    ranks_per_chip = par.ranks_per_chip if par is not None else chip.cores_per_chip
-    use_torus = topology is not None or mesh_axes is not None
-
     unit_hop_lat_s = (
         chip.ici_hop_latency_s
         if (
@@ -113,60 +112,96 @@ def _combine_modules(
         )
         else 0.0
     )
+    c_hops = collective_ici_hops(c, topology, ranks_per_chip, c_axes)
+    hop_s = c_hops * unit_hop_lat_s
+    submesh = submesh_for_group(c.group, topology, ranks_per_chip, c_axes)
+    anal_s = torus_collective_s(c.kind, c.payload, submesh, chip, topology)
+    return (hop_s, anal_s)
 
-    hop_lat_s = 0.0
-    for c in (c for m in modules for c in m.collectives if c.group > 1):
-        c_hops = collective_ici_hops(
-            c,
-            topology,
-            ranks_per_chip,
-            mesh_axes if (par is not None and c.group == par.tp) else None,
+
+def _dedup_module_collectives(
+    modules: tuple[ModuleCost, ...],
+) -> tuple[dict[_CollKey, int], list[tuple[_CollKey, Collective]]]:
+    """Aggregate collective call counts across all modules in a step."""
+    coll_counts: dict[_CollKey, int] = {}
+    coll_samples: list[tuple[_CollKey, Collective]] = []
+    for m in modules:
+        entries = (
+            m.unique_collectives
+            if m.unique_collectives is not None
+            else tuple((c, 1) for c in m.collectives)
         )
-        hop_lat_s += c_hops * unit_hop_lat_s
-
-    analytic_chain_s = sum(
-        torus_collective_s(
-            c.kind,
-            c.payload,
-            submesh_for_group(
+        for c, m_cnt in entries:
+            if c.group <= 1 or m_cnt <= 0:
+                continue
+            ckey = (
+                c.kind,
+                c.payload,
                 c.group,
-                topology,
-                ranks_per_chip,
-                mesh_axes if (par is not None and c.group == par.tp) else None,
-            ),
-            chip,
-            topology,
-        )
-        for m in modules
-        for c in m.collectives
-        if c.group > 1
-    )
+                c.wire_bytes,
+                c.offchip,
+                c.hops,
+            )
+            if ckey not in coll_counts:
+                coll_counts[ckey] = m_cnt
+                coll_samples.append((ckey, c))
+            else:
+                coll_counts[ckey] += m_cnt
+    return coll_counts, coll_samples
 
-    user_chain_lat_s = (
-        sum(
-            c.hops * collective_latency_s
-            for m in modules
-            for c in m.collectives
-            if c.group > 1
+
+def _combine_modules(
+    modules: tuple[ModuleCost, ...],
+    chip: ChipSpec,
+    collective_latency_s: float = 0.0,
+    *,
+    topology: SliceTopology | None = None,
+    par: Parallel | None = None,
+) -> StepFloor:
+    """Combine per-module resource costs into a StepFloor summary."""
+    has_finite_ici = chip.ici_bw > 0.0 and math.isfinite(chip.ici_bw)
+    tot_hbm_b = 0.0
+    tot_fp8 = 0.0
+    tot_bf16 = 0.0
+    tot_ici_b = 0.0
+    mod_serial_s = 0.0
+    for m in modules:
+        hb = m.hbm_bytes
+        f8 = m.fp8_flops
+        b16 = m.bf16_flops
+        tot_hbm_b += hb
+        tot_fp8 += f8
+        tot_bf16 += b16
+        if has_finite_ici:
+            tot_ici_b += m.ici_bytes
+        mod_serial_s += max(
+            hb / chip.hbm_bw, f8 / chip.fp8_flops + b16 / chip.bf16_flops
         )
-        if collective_latency_s > 0.0
-        else 0.0
-    )
+    hbm_s = tot_hbm_b / chip.hbm_bw
+    mm_s = tot_fp8 / chip.fp8_flops + tot_bf16 / chip.bf16_flops
+    ici_s = tot_ici_b / chip.ici_bw if has_finite_ici else 0.0
+    mesh_axes = par.mesh_axes if par is not None else None
+    ranks_per_chip = par.ranks_per_chip if par is not None else chip.cores_per_chip
+    use_torus = topology is not None or mesh_axes is not None
+
+    coll_counts, coll_samples = _dedup_module_collectives(modules)
+    hop_lat_s = 0.0
+    analytic_chain_s = 0.0
+    user_chain_lat_s = 0.0
+    for ckey, c in coll_samples:
+        cnt = coll_counts[ckey]
+        c_axes = mesh_axes if (par is not None and c.group == par.tp) else None
+        hop_s, anal_s = _unit_coll_times(c, topology, ranks_per_chip, c_axes, chip)
+        hop_lat_s += cnt * hop_s
+        analytic_chain_s += cnt * anal_s
+        if collective_latency_s > 0.0:
+            user_chain_lat_s += cnt * (c.hops * collective_latency_s)
     chain_s = analytic_chain_s + user_chain_lat_s
 
     resource_bound_s = max(hbm_s, mm_s, ici_s)
     latency_bound_s = hop_lat_s
     hard_floor_s = max(resource_bound_s, latency_bound_s, analytic_chain_s)
-    serial_floor_s = (
-        sum(
-            max(
-                m.hbm_bytes / chip.hbm_bw,
-                m.fp8_flops / chip.fp8_flops + m.bf16_flops / chip.bf16_flops,
-            )
-            for m in modules
-        )
-        + chain_s
-    )
+    serial_floor_s = mod_serial_s + chain_s
     if hard_floor_s == hbm_s:
         binding = "hbm"
     elif hard_floor_s == mm_s:
@@ -188,6 +223,7 @@ def _combine_modules(
     )
 
 
+@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
 def step_floor(
     geom: ModelGeometry,
     chip: ChipSpec,
@@ -198,7 +234,7 @@ def step_floor(
     """Compute the floor for one decode, prefill, or mixed forward pass."""
     opts = options or FloorOptions()
     return _combine_modules(
-        pass_costs(geom, par, shape, opts.dt),
+        pass_costs(geom, par, shape, opts.dt, mxu_m_tile=chip.mxu_m_tile),
         chip,
         collective_latency_s=opts.collective_latency_s,
         topology=opts.topology,
@@ -206,6 +242,7 @@ def step_floor(
     )
 
 
+@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
 def spec_cycle_floor(
     geom: ModelGeometry,
     chip: ChipSpec,
@@ -221,7 +258,9 @@ def spec_cycle_floor(
         context=spec.context,
         state_writes=1,
     )
-    verify_mods = list(pass_costs(geom, par, verify_shape, opts.dt))
+    verify_mods = list(
+        pass_costs(geom, par, verify_shape, opts.dt, mxu_m_tile=chip.mxu_m_tile)
+    )
     if spec.k <= 0:
         return _combine_modules(
             tuple(verify_mods),
@@ -236,6 +275,7 @@ def spec_cycle_floor(
         if (geom.kv_lora_rank > 0 and geom.index_topk > 0)
         else ("mla" if geom.kv_lora_rank > 0 else "full_attention")
     )
+    use_dense_mtp = geom.mtp_inter > 0
     draft_geom = ModelGeometry(
         hidden=geom.hidden,
         num_layers=1,
@@ -249,13 +289,13 @@ def spec_cycle_floor(
         linear_k_dim=0,
         linear_v_dim=0,
         conv_kernel=geom.conv_kernel,
-        num_experts=geom.num_experts,
-        top_k=geom.top_k,
-        moe_inter=geom.moe_inter,
-        shared_inter=geom.shared_inter,
+        num_experts=0 if use_dense_mtp else geom.num_experts,
+        top_k=0 if use_dense_mtp else geom.top_k,
+        moe_inter=0 if use_dense_mtp else geom.moe_inter,
+        shared_inter=0 if use_dense_mtp else geom.shared_inter,
         vocab=geom.vocab,
         mtp_layers=geom.mtp_layers,
-        dense_inter=geom.dense_inter,
+        dense_inter=geom.mtp_inter if use_dense_mtp else geom.dense_inter,
         q_lora_rank=geom.q_lora_rank,
         kv_lora_rank=geom.kv_lora_rank,
         qk_nope_head_dim=geom.qk_nope_head_dim,
@@ -265,37 +305,40 @@ def spec_cycle_floor(
         index_head_dim=geom.index_head_dim,
         index_topk=geom.index_topk,
         sliding_window=geom.sliding_window,
+        block_parallel=geom.block_parallel,
+        mtp_inter=geom.mtp_inter,
+        global_head_dim=geom.global_head_dim,
     )
     draft_shape = StepShape(
         batch=spec.batch, rows_per_seq=1, context=spec.context, state_writes=1
     )
-    one_draft = pass_costs(draft_geom, par, draft_shape, opts.dt)
+    one_draft = pass_costs(
+        draft_geom, par, draft_shape, opts.dt, mxu_m_tile=chip.mxu_m_tile
+    )
 
     fc_elems = MATMUL_FLOP_PER_MAC * float(geom.hidden * geom.hidden // par.tp)
     fc_fp8, fc_bf16 = _split_matmul_flops(
         spec.batch, fc_elems, opts.dt.w_aux, opts.dt.act
     )
     coll_cfg = CollectiveConfig(par.ar_algo, par.ranks_per_chip)
-    fc_colls = (
-        (
-            make(
-                "draft_fc_ag",
-                "ag",
-                float(spec.batch * geom.hidden) * ACTIVATION_BYTES_BF16,
-                par.tp,
-                coll_cfg,
-            ),
+    fc_unit = (
+        make(
+            "draft_fc_ag",
+            "ag",
+            float(spec.batch * geom.hidden) * ACTIVATION_BYTES_BF16,
+            par.tp,
+            coll_cfg,
         )
-        * spec.k
         if par.tp > 1
-        else ()
+        else None
     )
     draft_fc = ModuleCost(
         name="draft_fc",
         hbm_bytes=fc_elems * opts.dt.w_aux * spec.k,
         fp8_flops=fc_fp8 * spec.k,
         bf16_flops=fc_bf16 * spec.k,
-        collectives=fc_colls,
+        collectives=(fc_unit,) * spec.k if fc_unit is not None else (),
+        unique_collectives=((fc_unit, spec.k),) if fc_unit is not None else (),
     )
     verify_mods.extend(
         ModuleCost(
@@ -306,6 +349,11 @@ def spec_cycle_floor(
             collectives=m.collectives * spec.k,
             hbm_bytes_min=(
                 None if m.hbm_bytes_min is None else m.hbm_bytes_min * spec.k
+            ),
+            unique_collectives=(
+                None
+                if m.unique_collectives is None
+                else tuple((c, cnt * spec.k) for c, cnt in m.unique_collectives)
             ),
         )
         for m in one_draft

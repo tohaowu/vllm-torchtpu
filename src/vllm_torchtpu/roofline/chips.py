@@ -24,6 +24,7 @@ from .constants import (
     DEFAULT_ICI_BW,
     DEFAULT_ICI_HOP_LATENCY_S,
     DEFAULT_ICI_LINK_BW,
+    DEFAULT_MXU_M_TILE,
     FALLBACK_TPU_SPECS,
     MIN_TORUS_DIM,
     TOPOLOGY_AXES,
@@ -39,12 +40,13 @@ else:
 
 @dataclass(frozen=True)
 class ChipOverrides:
-    """Optional ICI interconnect overrides applied when constructing a ChipSpec."""
+    """Optional ICI and tile overrides applied when constructing a ChipSpec."""
 
     ici_link_bw: float = DEFAULT_ICI_LINK_BW
     ici_bw: float = DEFAULT_ICI_BW
     ici_hop_latency_s: float = DEFAULT_ICI_HOP_LATENCY_S
     cores_per_chip: int = DEFAULT_CORES_PER_CHIP
+    mxu_m_tile: int = DEFAULT_MXU_M_TILE
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,7 @@ class ChipSpec:
     cores_per_chip: int = DEFAULT_CORES_PER_CHIP
     ici_link_bw: float = DEFAULT_ICI_LINK_BW
     ici_hop_latency_s: float = DEFAULT_ICI_HOP_LATENCY_S
+    mxu_m_tile: int = DEFAULT_MXU_M_TILE
 
 
 def from_jax(
@@ -86,6 +89,7 @@ def from_jax(
             ici_link_bw=ovr.ici_link_bw,
             ici_bw=ovr.ici_bw,
             ici_hop_latency_s=ovr.ici_hop_latency_s,
+            mxu_m_tile=ovr.mxu_m_tile,
         )
     # Querying with logical cores_per_chip=1 returns per-TensorCore HBM, bandwidth,
     # MXU peaks, and VMEM; JAX's table omits ICI rates, so ChipOverrides supplies them.
@@ -101,6 +105,7 @@ def from_jax(
         ici_link_bw=ovr.ici_link_bw,
         ici_bw=ovr.ici_bw,
         ici_hop_latency_s=ovr.ici_hop_latency_s,
+        mxu_m_tile=ovr.mxu_m_tile,
     )
 
 
