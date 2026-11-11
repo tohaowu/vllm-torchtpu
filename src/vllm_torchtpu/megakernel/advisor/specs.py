@@ -483,6 +483,10 @@ class ScopeEstimate:
     blockers: tuple[str, ...] = ()
     w_step_strict_gb: float = 0.0
     step_floor_strict_us: float = 0.0
+    # Dense compute plus the routed-expert stage, max(routed HBM, MoE compute).
+    # The core is max(hbm_us, chain_us + comm_us) when fused, else
+    # max(hbm_us, chain_us) + comm_us.
+    chain_us: float = 0.0
 
     @property
     def step_ach_upper_us(self) -> float:

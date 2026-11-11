@@ -1134,7 +1134,7 @@ def compare_parallelism_candidates(
             pcp=layout.pcp,
             layer_groups=layout.layer_groups,
             moe_mode="grouped_on_chip" if prof.num_experts > 0 else "dense_mlp",
-            objective=objective,
+            objective="step",
         )
         rep = advise(prof, wl, chip_spec)
         valid = not _mesh_divisibility_reasons(prof, wl, chip_spec)
@@ -1150,6 +1150,7 @@ def compare_parallelism_candidates(
                 "step_floor_us": step_us,
                 "throughput_tok_s_per_chip": tput,
                 "recommended_scope": rep.recommended_scope,
+                "fastest_scope": rep.fastest_scope,
                 "hbm_fits": rep.hbm_fits,
                 "valid": valid,
             }

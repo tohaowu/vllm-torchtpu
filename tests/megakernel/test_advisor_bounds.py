@@ -1455,3 +1455,42 @@ def test_recommended_scope_metrics_and_hbm_oom_zero_tps() -> None:
     )
     assert rep_oom.hbm_fits is False
     assert float(rep_oom.metrics["throughput_tok_s_per_chip"]["value"]) == 0.0
+
+
+# Four terms rounded to 0.01 us each can differ from their sum by 0.02 us.
+SUBTERM_ROUNDING_US = 0.02
+
+
+@pytest.mark.parametrize(
+    ("model", "workload"),
+    [
+        (
+            "qwen3.5-397b",
+            advisor.WorkloadSpec(
+                phase="verify", batch=4, spec_tokens=3, context=4096, tp=8, dcp=4, ep=8
+            ),
+        ),
+        ("qwen3.5-397b", advisor.WorkloadSpec(phase="decode", batch=64, tp=8, ep=8)),
+        (
+            "qwen3.5-0.8b",
+            advisor.WorkloadSpec(
+                phase="prefill", batch=1, isl=512, chunk_size=512, tp=8
+            ),
+        ),
+    ],
+)
+def test_scope_subterms_reconstruct_roof_floor(
+    model: str, workload: advisor.WorkloadSpec
+) -> None:
+    """Verify chain_us with hbm_us and comm_us rebuilds every scope's floor."""
+    rep = advisor.advise(advisor.resolve_model_profile(model), workload, "tpu7x")
+    for sc in rep.scopes:
+        core_us = (
+            max(sc.hbm_us, sc.chain_us + sc.comm_us)
+            if sc.scope in ("whole_step", "layer_group")
+            else max(sc.hbm_us, sc.chain_us) + sc.comm_us
+        )
+        assert sc.chain_us >= sc.compute_us - SUBTERM_ROUNDING_US
+        assert core_us + sc.fill_drain_us == pytest.approx(
+            sc.roof_floor_us, abs=SUBTERM_ROUNDING_US
+        )

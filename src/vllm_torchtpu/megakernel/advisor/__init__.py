@@ -15,7 +15,20 @@
 
 from __future__ import annotations
 
-from . import chips, models, roofline, spec_bridge, specs, support, verdict, vmem
+from . import (
+    assets,
+    chips,
+    cli,
+    models,
+    regimes,
+    report,
+    roofline,
+    spec_bridge,
+    specs,
+    support,
+    verdict,
+    vmem,
+)
 from .chips import (
     BUILTIN_CHIP_SPECS,
     REQUIRED_CHIP_SPEC_KEYS,
@@ -30,6 +43,7 @@ from .chips import (
     resolve_chip_spec,
     verify_chip_spec_against_jax,
 )
+from .cli import build_arg_parser, main
 from .models import (
     DEPLOYMENT_PRESET_SOURCES,
     DEPLOYMENT_PRESETS,
@@ -46,6 +60,20 @@ from .models import (
     resolve_hf_snapshot_config,
     resolve_model_profile,
     supports_hf_config,
+)
+from .regimes import (
+    RegimeSweepOptions,
+    advise_regimes,
+    primary_step_mode,
+    recommend_parallelism,
+)
+from .report import (
+    format_advisor_summary,
+    format_regime_table,
+    render_advisor_html,
+    render_regime_dot_plot_svg,
+    svg_text_width,
+    write_advisor_html,
 )
 from .roofline import validate_workload
 from .spec_bridge import advise_from_spec
@@ -77,7 +105,11 @@ from .specs import (
     load_measurements,
 )
 from .support import CORE_LIMITS, CoreLimits, evaluate_support
-from .verdict import advise, compute_scope_raw_step_us
+from .verdict import (
+    advise,
+    compare_parallelism_candidates,
+    compute_scope_raw_step_us,
+)
 from .vmem import (
     compute_all_reduce_transfer_cost,
     compute_per_token_vmem_bytes,
@@ -123,6 +155,7 @@ __all__ = [
     "ProvenanceMetric",
     "ProvenanceTag",
     "RegimeEntry",
+    "RegimeSweepOptions",
     "RingPlan",
     "ScopeEstimate",
     "SupportStatus",
@@ -130,7 +163,12 @@ __all__ = [
     "WorkloadSpec",
     "advise",
     "advise_from_spec",
+    "advise_regimes",
+    "assets",
+    "build_arg_parser",
     "chips",
+    "cli",
+    "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "compute_scope_raw_step_us",
@@ -138,12 +176,21 @@ __all__ = [
     "detect_tpu_from_sysfs",
     "evaluate_support",
     "fit_vmem_budget_bytes",
+    "format_advisor_summary",
+    "format_regime_table",
     "load_chip_spec_file",
     "load_measurements",
     "load_public_calibration",
+    "main",
     "model_profile_from_hf_config",
     "models",
+    "primary_step_mode",
     "public_calibration_path",
+    "recommend_parallelism",
+    "regimes",
+    "render_advisor_html",
+    "render_regime_dot_plot_svg",
+    "report",
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
@@ -152,9 +199,11 @@ __all__ = [
     "specs",
     "support",
     "supports_hf_config",
+    "svg_text_width",
     "validate_advise_inputs",
     "validate_workload",
     "verdict",
     "verify_chip_spec_against_jax",
     "vmem",
+    "write_advisor_html",
 ]

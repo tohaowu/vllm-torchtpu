@@ -371,3 +371,44 @@ CORNER_AXES: Mapping[str, int] = {
     "collective_latency_us": 1,
     "prefill_attn_dot_dtype": 2,
 }
+
+DEFAULT_CHIP = "tpu7x"
+DEFAULT_PREFILL_ISL = 4096
+DEFAULT_SPEC_TOKENS = 3
+RECOMMEND_TP_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+RECOMMEND_DEFAULT_BATCH = 16
+RECOMMEND_HIGH_BATCH = 64
+RECOMMEND_HIGH_CTX = 32768
+SATURATION_BASE_BATCH = 256
+SATURATION_BATCH_CAP = 600
+INVALID_CONFIG_EXIT_CODE = 2
+
+SVG_MIN_FONT_PX = 13
+# Width of one glyph as a fraction of font size, a conservative upper bound for
+# the system sans-serif stack on digits, Latin letters, and punctuation.
+SVG_GLYPH_EM = 0.62
+SVG_TICKS: tuple[int, ...] = (1, 8, 64, 512, 4096, 32768)
+# Okabe-Ito colorblind-safe palette; each scope also has its own marker shape.
+SCOPE_MARKS: Mapping[str, tuple[str, str]] = {
+    "whole_step": ("#009E73", "circle"),
+    "layer_group": ("#56B4E9", "diamond"),
+    "single_layer": ("#E69F00", "diamond"),
+    "per_op": ("#CC79A7", "square"),
+}
+MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
+    "masked_on_chip": "Routed experts stream into VMEM; token rows are masked "
+    "per expert inside the fused call; no reordering",
+    "grouped_on_chip": "Tokens are grouped by expert inside VMEM, then each "
+    "expert runs on its rows inside the fused call",
+    "grouped_in_hbm": "Tokens are sorted by expert in HBM; the MoE is its own "
+    "call, so the kernel boundary falls at each MoE",
+    "dense_mlp": "Dense feed-forward; no routed experts",
+}
+SCOPE_HINTS: Mapping[str, str] = {
+    "whole_step": "one call for the whole step; [T, H] stays in VMEM. Rows past a "
+    "declared single-call limit run as separate calls that stream weights again; "
+    "tiling inside each layer past the VMEM ceiling is not implemented",
+    "layer_group": "one call per group of N layers, tiled like whole_step",
+    "single_layer": "one call per layer",
+    "per_op": "one call per operator; activations hand off through HBM",
+}
