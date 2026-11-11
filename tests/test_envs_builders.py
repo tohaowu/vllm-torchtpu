@@ -221,24 +221,14 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
 @pytest.mark.parametrize(
     "name,expected",
     [
+        ("TPU_KV_RESHARD_TRANSPORT", "raiden"),
         ("TPU_KV_TRANSFER_PORT", "9100"),
-        ("TPU_SIDE_CHANNEL_PORT", "9600"),
         ("TPU_NODE_ID", 0),
-        ("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
         ("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
         ("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", 1.0),
         ("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", True),
         ("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
         ("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
-        ("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
-        ("TPU_KV_SHM_POOL_GB", 128.0),
-        ("TPU_KV_TRANSFER_NAMESPACE", ""),
-        ("TPU_IPC_SOCKET_DIR", "/tmp"),
-        ("TPU_KV_WARMUP_ENABLED", True),
-        ("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
-        ("TPU_KV_PIN_SHM", False),
-        ("TPU_USE_RAIDEN_CONNECTOR", False),
-        ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
         ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
         ("TPU_RAIDEN_INLINE_LOAD", False),
         ("KDA_MANUAL_STATE_DMA", None),
@@ -270,6 +260,31 @@ def test_migrated_knob_defaults(monkeypatch, name, expected):
 
     monkeypatch.delenv(name, raising=False)
     assert envs.environment_variables[name]() == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, "raiden"),
+        (" RAIDEN ", "raiden"),
+        (" Custom ", "custom"),
+        ("", ""),
+        ("   ", ""),
+    ],
+)
+def test_tpu_kv_reshard_transport_open_string_parsing(monkeypatch, raw, expected):
+    """Unset defaults to 'raiden', non-empty values are stripped and lowercased,
+    and an explicit empty/whitespace string stays '' rather than silently
+    falling back to 'raiden'."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.delitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", raising=False)
+    if raw is None:
+        monkeypatch.delenv("TPU_KV_RESHARD_TRANSPORT", raising=False)
+    else:
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", raw)
+    actual = envs.TPU_KV_RESHARD_TRANSPORT
+    assert actual == expected
 
 
 def test_spec_warmup_off_spellings(monkeypatch):

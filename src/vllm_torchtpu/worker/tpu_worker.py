@@ -930,16 +930,6 @@ class TPUWorker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def get_node_kv_ip_port(self) -> tuple[int, str, int]:
-        node_id = dist_utils.get_node_id()
-        ip = dist_utils.get_host_ip()
-        tp_size = self.parallel_config.tensor_parallel_size
-        n_cfg = dist_utils.get_transfer_channel_number()
-        n_channels = tp_size if n_cfg <= 0 else min(n_cfg, tp_size)
-        n_channels = max(1, n_channels)
-        base_port = int(dist_utils.get_kv_transfer_port()) + node_id * n_channels
-        return (node_id, ip, base_port)
-
     def sync_weights(
         self,
         updated_weights,
