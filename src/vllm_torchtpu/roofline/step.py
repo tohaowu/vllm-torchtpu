@@ -88,11 +88,6 @@ class StepFloor:
     latency_assumed_s: float = 0.0
 
     @property
-    def serial_floor_s(self) -> float:
-        """Backward-compatible alias removed once solver updates in Commit 8b."""
-        return self.serial_estimate_s
-
-    @property
     def resource_bound_s(self) -> float:
         """Maximum time across HBM, matmul, and collective cut bounds."""
         return max(self.hbm_bound_s, self.mm_bound_s, self.coll_bound_s)
@@ -199,7 +194,7 @@ def _sum_module_resources(
     return (hbm_s, mm_s, ici_s, hbm_bound_s, mm_bound_s, mod_serial_s)
 
 
-def _combine_modules(
+def combine_modules(
     modules: tuple[ModuleCost, ...],
     chip: ChipSpec,
     collective_latency_s: float = 0.0,
@@ -271,7 +266,7 @@ def step_floor(
 ) -> StepFloor:
     """Compute the floor for one decode, prefill, or mixed forward pass."""
     opts = options or FloorOptions()
-    return _combine_modules(
+    return combine_modules(
         pass_costs(geom, par, shape, opts.dt, mxu_m_tile=chip.mxu_m_tile),
         chip,
         collective_latency_s=opts.collective_latency_s,
@@ -300,7 +295,7 @@ def spec_cycle_floor(
         pass_costs(geom, par, verify_shape, opts.dt, mxu_m_tile=chip.mxu_m_tile)
     )
     if spec.k <= 0:
-        return _combine_modules(
+        return combine_modules(
             tuple(verify_mods),
             chip,
             collective_latency_s=opts.collective_latency_s,
@@ -403,7 +398,7 @@ def spec_cycle_floor(
         for m in one_draft
     )
     verify_mods.append(draft_fc)
-    return _combine_modules(
+    return combine_modules(
         tuple(verify_mods),
         chip,
         collective_latency_s=opts.collective_latency_s,

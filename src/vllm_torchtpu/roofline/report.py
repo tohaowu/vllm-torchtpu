@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone HTML report renderer for analytical roofline solve/v1 payloads."""
+"""Standalone HTML report renderer for analytical roofline solve/v2 payloads."""
 
 from __future__ import annotations
 
@@ -21,11 +21,12 @@ import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from .chips import CHIPS
+from .chips import CHIPS, ChipSpec, chip_catalog, format_constant_display
 from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
     MAX_EMBEDDED_CANDIDATES,
     MIN_FRONTIER_POINTS_FOR_POLYLINE,
+    PREFIX_RANGE_PAIR_LEN,
     UNIT_GIGA,
     UNIT_MEGA,
     UNIT_PETA,
@@ -98,7 +99,7 @@ def _render_frontier_svg(
     ) * 1.15
     max_y = (
         max(
-            (_as_float(p.get("p90_interactivity_tok_s")) for p in all_pts),
+            (_as_float(p.get("est_interactivity_tok_s")) for p in all_pts),
             default=0.0,
         )
         or 1.0
@@ -128,7 +129,7 @@ def _render_frontier_svg(
         f'<text x="18" y="{pad_top + plot_h // 2}" text-anchor="middle" '
         'font-size="12" fill="#475569" '
         f'transform="rotate(-90, 18, {pad_top + plot_h // 2})">'
-        "p90 Interactivity (tok/s)</text>",
+        "Est. Interactivity (tok/s)</text>",
     ]
 
     for i in range(5):
@@ -150,7 +151,7 @@ def _render_frontier_svg(
 
     for p in all_pts:
         tput = _as_float(p.get("token_throughput_per_chip"))
-        inter = _as_float(p.get("p90_interactivity_tok_s"))
+        inter = _as_float(p.get("est_interactivity_tok_s"))
         t_tip = (
             f"c={_as_int(p.get('concurrency'), 1)} | "
             f"{tput:.1f} tok/s/chip | {inter:.1f} tok/s"
@@ -167,7 +168,7 @@ def _render_frontier_svg(
     if len(sorted_f) >= MIN_FRONTIER_POINTS_FOR_POLYLINE:
         poly_pts = " ".join(
             f"{scale_x(_as_float(p.get('token_throughput_per_chip'))):.1f},"
-            f"{scale_y(_as_float(p.get('p90_interactivity_tok_s'))):.1f}"
+            f"{scale_y(_as_float(p.get('est_interactivity_tok_s'))):.1f}"
             for p in sorted_f
         )
         svg_parts.append(
@@ -177,12 +178,12 @@ def _render_frontier_svg(
 
     for p in sorted_f:
         tput = _as_float(p.get("token_throughput_per_chip"))
-        inter = _as_float(p.get("p90_interactivity_tok_s"))
+        inter = _as_float(p.get("est_interactivity_tok_s"))
         f_tip = (
             f"Frontier: c={_as_int(p.get('concurrency'), 1)} | "
             f"{tput:.1f} tok/s/chip | {inter:.1f} tok/s | "
-            f"TTFT: {_as_float(p.get('p90_ttft_ms')):.1f}ms | "
-            f"TPOT: {_as_float(p.get('p90_tpot_ms')):.2f}ms"
+            f"TTFT: {_as_float(p.get('est_ttft_ms')):.1f}ms | "
+            f"TPOT: {_as_float(p.get('est_tpot_ms')):.2f}ms"
         )
         svg_parts.append(
             f'<circle cx="{scale_x(tput):.1f}" cy="{scale_y(inter):.1f}" r="5.5" '
@@ -388,6 +389,10 @@ h2 { font-size: 18px; font-weight: 600; margin-bottom: 14px; color: #1e293b; }
   color: var(--primary);
   margin-right: 6px;
 }
+.badge-fact { background-color: #dcfce7; color: #166534; }
+.badge-derived { background-color: #e0f2fe; color: #0369a1; }
+.badge-assumed { background-color: #fef3c7; color: #92400e; }
+.badge-config { background-color: #f3e8ff; color: #6b21a8; }
 .card {
   background: var(--bg-card);
   border: 1px solid var(--border);
@@ -538,14 +543,26 @@ def _extract_recommended_view(
             for p in pools_list
         )
         floor = _as_mapping(rec.get("decode_floor"))
+        ttft_val = _as_float(rec.get("est_ttft_ms"))
+        tpot_val = _as_float(rec.get("est_tpot_ms"))
+        bound_ttft = rec.get("bound_ttft_ms")
+        bound_tpot = rec.get("bound_tpot_ms")
         rec_fields: dict[str, object] = {
             "mode": str(rec.get("mode", "")).upper(),
             "chips": _as_int(rec.get("total_chips"), 0),
             "concurrency": _as_int(rec.get("concurrency"), 1),
             "tput": f"{_as_float(rec.get('token_throughput_per_chip')):.1f}",
-            "interactivity": f"{_as_float(rec.get('p90_interactivity_tok_s')):.1f}",
-            "ttft": f"{_as_float(rec.get('p90_ttft_ms')):.1f}",
-            "tpot": f"{_as_float(rec.get('p90_tpot_ms')):.2f}",
+            "interactivity": f"{_as_float(rec.get('est_interactivity_tok_s')):.1f}",
+            "ttft": (
+                f"{_as_float(bound_ttft):.1f} ~ {ttft_val:.1f}"
+                if bound_ttft is not None
+                else f"{ttft_val:.1f}"
+            ),
+            "tpot": (
+                f"{_as_float(bound_tpot):.2f} ~ {tpot_val:.2f}"
+                if bound_tpot is not None
+                else f"{tpot_val:.2f}"
+            ),
             "binding": str(rec.get("binding", "hbm")),
             "decode_floor": floor or None,
         }
@@ -604,7 +621,7 @@ def _render_table_rows(top_k: Sequence[Mapping[str, object]]) -> str:
     """Format top candidate layout options into HTML table rows."""
     if not top_k:
         return (
-            '<tr><td colspan="12" style="text-align:center;">'
+            '<tr><td colspan="13" style="text-align:center;">'
             "No feasible layouts found</td></tr>"
         )
     rows: list[str] = []
@@ -616,10 +633,11 @@ def _render_table_rows(top_k: Sequence[Mapping[str, object]]) -> str:
         mode_val = str(pt.get("mode", ""))
         c_val = _as_int(pt.get("concurrency"), 1)
         chips_val = _as_int(pt.get("total_chips"), 0)
-        int_val = f"{_as_float(pt.get('p90_interactivity_tok_s')):.1f}"
+        int_val = f"{_as_float(pt.get('est_interactivity_tok_s')):.1f}"
         tput_val = f"{_as_float(pt.get('token_throughput_per_chip')):.1f}"
-        ttft_val = f"{_as_float(pt.get('p90_ttft_ms')):.1f}"
-        tpot_val = f"{_as_float(pt.get('p90_tpot_ms')):.2f}"
+        bound_tpot_val = f"{_as_float(pt.get('bound_tpot_ms')):.2f}"
+        ttft_val = f"{_as_float(pt.get('est_ttft_ms')):.1f}"
+        tpot_val = f"{_as_float(pt.get('est_tpot_ms')):.2f}"
         cap_raw = pt.get("kv_cache_capacity_tokens")
         cap_str = f"{_as_int(cap_raw):,}" if cap_raw is not None else "inf"
         eff_hit = _as_float(pt.get("effective_prefix_hit_rate"))
@@ -648,6 +666,7 @@ def _render_table_rows(top_k: Sequence[Mapping[str, object]]) -> str:
             f"<td><code>{_escape(p_str)}</code></td>"
             f"<td>{int_val}</td>"
             f"<td>{tput_val}</td>"
+            f"<td>{bound_tpot_val}</td>"
             f"<td>{ttft_val}</td>"
             f"<td>{tpot_val}</td>"
             f"<td>{_escape(cap_str)} / {eff_hit:.2f}</td>"
@@ -670,6 +689,76 @@ def _derive_default_hbm_limit_gb(payload: Mapping[str, object]) -> float:
     return (hbm_bytes * util) / UNIT_GIGA
 
 
+def _build_dynamic_chip_spec(
+    chip_spec: Mapping[str, object],
+    fallback: ChipSpec,
+    chip_name: str,
+) -> ChipSpec:
+    """Build ChipSpec when payload lacks an embedded catalog."""
+    return ChipSpec(
+        name=chip_name,
+        hbm_bytes=int(_as_float(chip_spec.get("hbm_bytes"), float(fallback.hbm_bytes))),
+        hbm_bw=_as_float(chip_spec.get("hbm_bw"), fallback.hbm_bw),
+        bf16_flops=_as_float(chip_spec.get("bf16_flops"), fallback.bf16_flops),
+        fp8_flops=_as_float(chip_spec.get("fp8_flops"), fallback.fp8_flops),
+        vmem_bytes=int(
+            _as_float(chip_spec.get("vmem_bytes"), float(fallback.vmem_bytes))
+        ),
+        ici_bw=_as_float(chip_spec.get("ici_bw"), fallback.ici_bw),
+        cores_per_chip=_as_int(
+            chip_spec.get("cores_per_chip"), fallback.cores_per_chip
+        ),
+        ici_link_bw=_as_float(chip_spec.get("ici_link_bw"), fallback.ici_link_bw),
+        d2d_bw=_as_float(chip_spec.get("d2d_bw"), fallback.d2d_bw),
+        ici_hop_latency_s=_as_float(
+            chip_spec.get("ici_hop_latency_s"), fallback.ici_hop_latency_s
+        ),
+        mxu_m_tile=_as_int(chip_spec.get("mxu_m_tile"), fallback.mxu_m_tile),
+        dcn_host_gbit_per_s=_as_float(
+            chip_spec.get("dcn_host_gbit_per_s"), fallback.dcn_host_gbit_per_s
+        ),
+        chips_per_host=_as_int(
+            chip_spec.get("chips_per_host"), fallback.chips_per_host
+        ),
+        dcn_bw=_as_float(chip_spec.get("dcn_bw"), fallback.dcn_bw),
+        pcie_bw=_as_float(chip_spec.get("pcie_bw"), fallback.pcie_bw),
+    )
+
+
+def _format_catalog_entry_row(key: str, entry: Mapping[str, object]) -> str:
+    """Render one catalog entry into an HTML table row."""
+    kind = _escape(entry.get("kind", ""))
+    scope = _escape(entry.get("scope", ""))
+    unit = str(entry.get("unit", ""))
+    val = entry.get("value", "")
+    val_str = f"{val:.4g}" if isinstance(val, float) else str(val)
+    desc_str = _escape(entry.get("description", ""))
+    src = _escape(entry.get("source", ""))
+    display = entry.get("display")
+    computed = (
+        format_constant_display(_as_float(val), unit)
+        if (val != "" and unit != "")
+        else ""
+    )
+    if not display or (
+        computed and str(computed).split()[0] != str(display).split()[0]
+    ):
+        display = computed or display
+    display_str = _escape(display or f"{val_str} {unit}")
+    val_sub = f"{val} {unit}".strip()
+    return (
+        "          <tr>"
+        f"<td><code>{_escape(key)}</code></td>"
+        f"<td><strong>{display_str}</strong><br>"
+        f'<small style="color: #64748b;">{_escape(val_sub)}</small></td>'
+        f"<td><code>{scope}</code></td>"
+        f'<td><span class="badge badge-{kind}">{kind}</span></td>'
+        f"<td>{desc_str}</td>"
+        f'<td style="font-size: 0.85em; color: #475569;">{src}</td>'
+        "</tr>"
+    )
+
+
 def _render_chip_specs_item(payload: Mapping[str, object]) -> str:
     """Render dynamic Per-TensorCore hardware specification line from chip_spec."""
     fallback = CHIPS["tpu7x"]
@@ -690,10 +779,13 @@ def _render_chip_specs_item(payload: Mapping[str, object]) -> str:
         _as_float(chip_spec.get("ici_link_bw"), fallback.ici_link_bw) / UNIT_GIGA
     )
     ici_bw_gbps = _as_float(chip_spec.get("ici_bw"), fallback.ici_bw) / UNIT_GIGA
+    d2d_gbps = _as_float(chip_spec.get("d2d_bw"), fallback.d2d_bw) / UNIT_GIGA
     hop_us = (
         _as_float(chip_spec.get("ici_hop_latency_s"), fallback.ici_hop_latency_s)
         * UNIT_MEGA
     )
+    dcn_gbps = _as_float(chip_spec.get("dcn_bw"), fallback.dcn_bw) / UNIT_GIGA
+    pcie_gbps = _as_float(chip_spec.get("pcie_bw"), fallback.pcie_bw) / UNIT_GIGA
     m_tile = _as_int(chip_spec.get("mxu_m_tile"), 0)
     tile_str = f"<code>{m_tile}</code>-row MXU tile, " if m_tile > 0 else ""
     return (
@@ -705,8 +797,88 @@ def _render_chip_specs_item(payload: Mapping[str, object]) -> str:
         f"<code>{fp8_pf:.3f} PFLOP/s</code> FP8, "
         f"{tile_str}"
         f"<code>{ici_link_gbps:.0f} GB/s</code>/link "
-        f"(<code>{ici_bw_gbps:.0f} GB/s</code>/core) ICI + "
-        f"<code>{hop_us:.1f} us</code> hop.</li>"
+        f"(<code>{ici_bw_gbps:.0f} GB/s</code>/core, "
+        f"<code>{d2d_gbps:.0f} GB/s</code>/chip D2D) ICI + "
+        f"<code>{hop_us:.1f} us</code> hop, "
+        f"<code>{dcn_gbps:.2f} GB/s</code>/chip DCN, and "
+        f"<code>{pcie_gbps:.1f} GB/s</code>/chip PCIe.</li>"
+    )
+
+
+def _render_assumptions_card(payload: Mapping[str, object]) -> list[str]:
+    """Render Assumptions, Hardware Specs & Scope card with constants catalog."""
+    fallback = CHIPS["tpu7x"]
+    chip_spec = _as_mapping(payload.get("chip_spec"))
+    chip_name = str(chip_spec.get("name") or payload.get("chip") or fallback.name)
+    cat_raw = chip_spec.get("catalog")
+    if isinstance(cat_raw, Mapping):
+        cat = cat_raw
+    else:
+        cat = chip_catalog(_build_dynamic_chip_spec(chip_spec, fallback, chip_name))
+    cat_rows = [
+        _format_catalog_entry_row(str(k), _as_mapping(entry_raw))
+        for k, entry_raw in cat.items()
+        if isinstance(entry_raw, Mapping)
+    ]
+    chip_specs_item = _render_chip_specs_item(payload)
+    return [
+        '  <section class="card assumptions-card">',
+        "    <h2>Assumptions, Hardware Specs &amp; Scope</h2>",
+        "    <ul>",
+        "      <li><strong>Datasheet Bounds:</strong> <code>Hard Floor</code> is "
+        "<code>max(HBM, Matmul, ICI)</code> "
+        "(full communication-compute overlap); "
+        "<code>Serial Estimate</code> sums per-module "
+        "<code>max(HBM, Matmul)</code> plus exposed <code>ICI Chain</code> "
+        "(zero overlap) for layout ranking.</li>",
+        chip_specs_item,
+        "      <li><strong>Intentionally Omitted (Day-1 Trace Scope):</strong> "
+        "Empirical kernel utilization derates, XLA temporary workspace "
+        "(<code>8 ~ 15 GB/core</code>), "
+        "and trace-level LRU cache eviction or arrival burstiness.</li>",
+        "    </ul>",
+        "    <details open><summary>Constants Catalog "
+        "(fact / derived / assumed / config)</summary>",
+        '    <div style="overflow-x: auto; margin-top: 0.75rem;">',
+        "      <table>",
+        "        <thead>",
+        "          <tr>",
+        '            <th style="text-align: left;">Constant</th>',
+        '            <th style="text-align: left;">Value</th>',
+        '            <th style="text-align: left;">Scope</th>',
+        '            <th style="text-align: left;">Kind</th>',
+        '            <th style="text-align: left;">Description</th>',
+        '            <th style="text-align: left;">Source / Derivation</th>',
+        "          </tr>",
+        "        </thead>",
+        "        <tbody>",
+        *[f"    {row}" for row in cat_rows],
+        "        </tbody>",
+        "      </table>",
+        "    </div>",
+        "    </details>",
+        "  </section>",
+    ]
+
+
+def _render_crossover_stat_html(payload: Mapping[str, object]) -> str:
+    """Render prefix-hit regime banner box when sweep winner range exists."""
+    win_range = _as_sequence(payload.get("winner_prefix_hit_range"))
+    if len(win_range) != PREFIX_RANGE_PAIR_LEN:
+        return ""
+    cross_rate = payload.get("prefix_hit_crossover_rate")
+    range_txt = f"[{_as_float(win_range[0]):.2f}, {_as_float(win_range[1]):.2f}]"
+    cross_txt = (
+        f"crossover={_as_float(cross_rate):.2f}" if cross_rate is not None else "stable"
+    )
+    return (
+        '      <div class="stat-box">'
+        '        <div class="stat-label">Prefix-Hit Regime</div>'
+        '        <div class="stat-value" style="font-size:15px;">'
+        f"{_escape(range_txt)} "
+        '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
+        f"({_escape(cross_txt)})</span></div>"
+        "      </div>"
     )
 
 
@@ -723,6 +895,7 @@ def render_html(payload: Mapping[str, object]) -> str:
     chip = str(payload.get("chip") or "TPU")
 
     embedded_payload = dict(payload)
+    embedded_payload.pop("sweep_candidates", None)
     embedded_payload["candidates"] = _downsample_embedded_candidates(candidates)
     embedded_json = json.dumps(embedded_payload, indent=2).replace("</", "<\\/")
 
@@ -748,7 +921,7 @@ def render_html(payload: Mapping[str, object]) -> str:
     warnings_html = _render_warnings_html(warnings)
     launch_cmds_html = _render_launch_cmds_html(top_k)
     top_table_body = _render_table_rows(top_k)
-    chip_specs_item = _render_chip_specs_item(payload)
+    crossover_stat_html = _render_crossover_stat_html(payload)
 
     scen_name = _escape(scenario.get("name", "custom"))
     scen_isl = _as_int(scenario.get("isl"))
@@ -792,19 +965,19 @@ def render_html(payload: Mapping[str, object]) -> str:
         "tok/s/chip</span></div>",
         "      </div>",
         '      <div class="stat-box">',
-        '        <div class="stat-label">p90 Interactivity</div>',
+        '        <div class="stat-label">Est. Interactivity</div>',
         f'        <div class="stat-value">{rec_fields["interactivity"]} '
         '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
         "tok/s</span></div>",
         "      </div>",
         '      <div class="stat-box">',
-        '        <div class="stat-label">p90 TTFT</div>',
+        '        <div class="stat-label">TTFT (bound ~ est)</div>',
         f'        <div class="stat-value">{rec_fields["ttft"]} '
         '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
         "ms</span></div>",
         "      </div>",
         '      <div class="stat-box">',
-        '        <div class="stat-label">p90 TPOT</div>',
+        '        <div class="stat-label">TPOT (bound ~ est)</div>',
         f'        <div class="stat-value">{rec_fields["tpot"]} '
         '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
         "ms</span></div>",
@@ -814,6 +987,7 @@ def render_html(payload: Mapping[str, object]) -> str:
         '        <div class="stat-value" style="font-size:16px;">'
         f"{_escape(rec_fields['binding'])}</div>",
         "      </div>",
+        crossover_stat_html,
         "    </div>",
         f"    {launch_cmds_html}",
         "  </section>",
@@ -846,6 +1020,13 @@ def render_html(payload: Mapping[str, object]) -> str:
         "  </section>",
         '  <section id="frontier-chart" class="card">',
         "    <h2>Pareto Frontier (Interactivity vs. Throughput)</h2>",
+        (
+            '    <p class="section-note" '
+            'style="color:var(--text-muted);font-size:13px;margin-top:4px;">'
+            "Throughput and interactivity are model estimates "
+            "(<code>est_*</code>); latency bounds (<code>bound_*</code>) are "
+            "hard physical lower limits.</p>"
+        ),
         f'    <div class="chart-container">{frontier_svg}</div>',
         "  </section>",
         '  <section id="limits-chart" class="card">',
@@ -867,10 +1048,11 @@ def render_html(payload: Mapping[str, object]) -> str:
         "          <th>Conc</th>",
         "          <th>Chips</th>",
         "          <th>Pools</th>",
-        "          <th>Int (tok/s)</th>",
+        "          <th>Int (tok/s) [est]</th>",
         "          <th>Tput (tok/s/chip)</th>",
-        "          <th>TTFT (ms)</th>",
-        "          <th>TPOT (ms)</th>",
+        "          <th>TPOT Bound (ms) [bound]</th>",
+        "          <th>TTFT (ms) [est]</th>",
+        "          <th>TPOT (ms) [est]</th>",
         "          <th>KV Cap / Hit</th>",
         "          <th>Launch Command</th>",
         "        </tr>",
@@ -879,21 +1061,16 @@ def render_html(payload: Mapping[str, object]) -> str:
         f"        {top_table_body}",
         "      </tbody>",
         "    </table>",
+        (
+            '    <p class="section-note" '
+            'style="color:var(--text-muted);font-size:13px;margin-top:8px;">'
+            "Note: Columns marked <code>[bound]</code> (such as "
+            "<code>bound_tpot_ms</code>) are hard physical lower bounds; "
+            "columns marked <code>[est]</code> (such as <code>est_ttft_ms</code> "
+            "and <code>est_tpot_ms</code>) are model estimates.</p>"
+        ),
         "  </section>",
-        '  <section class="card assumptions-card">',
-        "    <h2>Assumptions, Hardware Specs &amp; Scope</h2>",
-        "    <ul>",
-        "      <li><strong>Datasheet Bounds:</strong> <code>Hard Floor</code> is "
-        "<code>max(HBM, Matmul, ICI Chain)</code> "
-        "(full communication-compute overlap); "
-        "<code>Serial Floor</code> sums per-module <code>max(HBM, Matmul)</code> plus "
-        "exposed <code>ICI Chain</code> (zero overlap) for layout ranking.</li>",
-        chip_specs_item,
-        "      <li><strong>Intentionally Omitted (Day-1 Trace Scope):</strong> "
-        "Empirical kernel utilization derates, XLA temporary workspace, "
-        "and trace-level LRU cache eviction or arrival burstiness.</li>",
-        "    </ul>",
-        "  </section>",
+        *_render_assumptions_card(payload),
         "  <footer>",
         "    Analytical roofline report generated by "
         "<code>vllm_torchtpu.roofline</code> &bull; "

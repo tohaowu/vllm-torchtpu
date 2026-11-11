@@ -26,6 +26,7 @@ from vllm_torchtpu.roofline import (
     CHIPS,
     SOLVE_SCHEMA,
     Dtypes,
+    LaunchOptions,
     ParetoPoint,
     PoolMeshPlan,
     ServingPlan,
@@ -60,7 +61,7 @@ class _PoolConfig:
     pp: int = 1
     pcp: int = 1
     kv_split: int = 1
-    moe_dispatch: str = "allreduce"
+    moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
 
 
 def _toy_moe_config_dict() -> dict[str, object]:
@@ -167,9 +168,9 @@ def test_emit_launch_args_mixed_and_disagg() -> None:
         total_chips=4,
         prefill_pool=None,
         decode_pool=mixed_pool,
-        p90_ttft_ms=180.0,
-        p90_tpot_ms=12.0,
-        p90_interactivity_tok_s=83.3,
+        est_ttft_ms=180.0,
+        est_tpot_ms=12.0,
+        est_interactivity_tok_s=83.3,
         output_throughput_per_chip=320.0,
         token_throughput_per_chip=2880.0,
         p_mixed=0.15,
@@ -213,9 +214,9 @@ def test_emit_launch_args_mixed_and_disagg() -> None:
         total_chips=20,
         prefill_pool=prefill_pool,
         decode_pool=decode_pool,
-        p90_ttft_ms=140.0,
-        p90_tpot_ms=9.5,
-        p90_interactivity_tok_s=105.2,
+        est_ttft_ms=140.0,
+        est_tpot_ms=9.5,
+        est_interactivity_tok_s=105.2,
         output_throughput_per_chip=336.8,
         token_throughput_per_chip=3031.2,
         p_mixed=0.0,
@@ -237,11 +238,18 @@ def test_emit_launch_args_mixed_and_disagg() -> None:
         dtypes=Dtypes(kv=1.0),
         model="Qwen/Qwen3.5-397B-A17B-FP8",
     )
-    expected_commands = 2
     assert "--prefill-context-parallel-size" in disagg_out["prefill_cli_args"]
-    assert len(disagg_out["commands"]) == expected_commands
-    assert disagg_out["commands"][0].startswith("# prefill (1x 2x2x1): vllm serve")
-    assert disagg_out["commands"][1].startswith("# decode (2x 2x2x2): vllm serve")
+    assert any(c.startswith("# provision: prefill") for c in disagg_out["commands"])
+    assert any(c.startswith("# provision: decode") for c in disagg_out["commands"])
+    assert any(
+        c.startswith("vllm serve") and "--prefill-context-parallel-size" in c
+        for c in disagg_out["commands"]
+    )
+    assert any(
+        c.startswith("vllm serve") and "--decode-context-parallel-size" not in c
+        for c in disagg_out["commands"]
+    )
+    assert any(c.startswith("# note:") for c in disagg_out["commands"])
 
 
 def test_emit_launch_args_infeasible_plan_returns_empty_and_cli_nonzero(
@@ -321,11 +329,11 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     rows = emit_ceiling_rows(splan)
     assert len(rows) >= 1
     assert list(rows[0].keys())[:5] == [
-        "p90_interactivity_tok_s",
+        "est_interactivity_tok_s",
         "token_throughput_per_chip",
         "output_throughput_per_chip",
-        "p90_ttft_ms",
-        "p90_tpot_ms",
+        "est_ttft_ms",
+        "est_tpot_ms",
     ]
 
     cfg_path = tmp_path / "config.json"
@@ -372,7 +380,7 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     out_ceil = json.loads(capsys.readouterr().out)
     assert rc_ceil == 0
     assert len(out_ceil) >= 1
-    assert "p90_interactivity_tok_s" in out_ceil[0]
+    assert "est_interactivity_tok_s" in out_ceil[0]
 
 
 def test_resident_batch_cap_emits_max_num_seqs_without_tput_inflation() -> None:
@@ -433,7 +441,7 @@ def test_resident_batch_cap_emits_max_num_seqs_without_tput_inflation() -> None:
     assert pt_256.token_throughput_per_chip == pytest.approx(
         pt_15.token_throughput_per_chip, rel=1e-6
     )
-    assert pt_256.p90_ttft_ms > pt_15.p90_ttft_ms
+    assert pt_256.est_ttft_ms > pt_15.est_ttft_ms
 
 
 def test_top_layouts_distinct_and_led_by_recommended() -> None:
@@ -619,9 +627,9 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
             total_chips=8,
             prefill_pool=None,
             decode_pool=pool,
-            p90_ttft_ms=100.0,
-            p90_tpot_ms=1000.0 / inter,
-            p90_interactivity_tok_s=inter,
+            est_ttft_ms=100.0,
+            est_tpot_ms=1000.0 / inter,
+            est_interactivity_tok_s=inter,
             output_throughput_per_chip=tput * 0.1,
             token_throughput_per_chip=tput,
             p_mixed=0.05,
@@ -649,7 +657,9 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
     top = top_layouts(splan, k=top_k)
     assert top == (a1, b, d)
     cmds = {
-        tuple(point_launch_args(pt, kv_dtype="fp8", model="m")["commands"])
+        tuple(
+            point_launch_args(pt, LaunchOptions(kv_dtype="fp8", model="m"))["commands"]
+        )
         for pt in top
     }
     assert len(cmds) == top_k
@@ -665,3 +675,137 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
     margins = [entry["margin_vs_rank1_pct"] for entry in payload["top_k"]]
     assert roles == ["max_throughput", "balanced_knee", "max_interactivity"]
     assert margins == [0.0, -16.0, -50.0]
+
+
+def test_emit_omits_mtp_speculative_config_when_mtp_layers_zero() -> None:
+    """Verify emit_launch_args omits --speculative-config when MTP layers is 0."""
+    scen = TrafficScenario(
+        name="custom",
+        isl=1024,
+        osl=128,
+        concurrencies=(16,),
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+        spec_tokens=3,
+    )
+    pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        tp=8,
+        dp=1,
+        pp=1,
+        pcp=1,
+        ep=1,
+        kv_split=1,
+        chips_per_instance=8,
+        topology="2x2x2",
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=10.0,
+        hbm_limit_gb=94.76,
+    )
+    pt = ParetoPoint(
+        mode="mixed",
+        concurrency=16,
+        total_chips=8,
+        prefill_pool=None,
+        decode_pool=pool,
+        est_ttft_ms=50.0,
+        est_tpot_ms=20.0,
+        est_interactivity_tok_s=50.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=1000.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+    )
+    plan = ServingPlan(
+        model_layers=32,
+        chip="tpu7x",
+        scenario=scen,
+        mode="mixed",
+        recommended=pt,
+        frontier=(pt,),
+        warnings=(),
+        candidates=(pt,),
+        mtp_layers=0,
+        spec_tokens=3,
+    )
+    emitted = emit_launch_args(plan, dtypes=Dtypes(kv=1.0), model="test-model")
+    assert "--speculative-config" not in emitted["cli_args"]
+    assert "--speculative-config" not in emitted["commands"][0]
+    assert any("omitting --speculative-config" in w for w in emitted["warnings"])
+
+
+def test_emit_dispatch_env_and_enable_ep_for_fused_rs() -> None:
+    """Verify ag_ep omits phantom env and fused_rs emits --enable-expert-parallel."""
+    ag_pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x2",
+        chips_per_instance=8,
+        tp=4,
+        dp=4,
+        ep=16,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=10.0,
+        hbm_limit_gb=94.76,
+        moe_dispatch="ag_ep",
+    )
+    ag_pt = ParetoPoint(
+        mode="mixed",
+        concurrency=16,
+        total_chips=8,
+        prefill_pool=None,
+        decode_pool=ag_pool,
+        est_ttft_ms=50.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=1000.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+    )
+    ag_cmd = point_launch_args(ag_pt, LaunchOptions(model="m"))["commands"][0]
+    assert "ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE" not in ag_cmd
+
+    rs_pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=1,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 1, 1),
+        hbm_used_gb=10.0,
+        hbm_limit_gb=94.76,
+        moe_dispatch="fused_rs",
+    )
+    assert "--enable-expert-parallel" in pool_cli_args(rs_pool)
+    rs_pt = ParetoPoint(
+        mode="mixed",
+        concurrency=8,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=rs_pool,
+        est_ttft_ms=50.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=1000.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+    )
+    rs_cmd = point_launch_args(rs_pt, LaunchOptions(model="m"))["commands"][0]
+    assert "TPU_MOE_SEQUENCE_PARALLEL=1" in rs_cmd
+    assert "--enable-expert-parallel" in rs_cmd

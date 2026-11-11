@@ -164,6 +164,7 @@ UNIT_MILLIS_PER_SECOND: float = 1.0e3
 UNIT_MICROS_PER_SECOND: float = 1.0e-6
 BIN_KIBI: float = 1024.0
 BIN_MEBI: float = 1048576.0
+UNIT_GIBI: float = float(1 << 30)
 PERCENT_SCALE: float = 100.0
 
 # HF config loader & quantization constants.
@@ -224,6 +225,9 @@ SPARSE_MLA_SCALE_BYTES: float = 4.0
 HEAD_DIM_PACKING_THRESHOLD: int = 64
 GLU_MATMUL_COUNT: int = 3
 DEFAULT_MAX_INSTANCES: int = 16
+DEFAULT_HBM_RESERVE_GB: float = 0.0
+DEFAULT_PREFILL_CHUNK: int = 2048
+EP_PAIR_RANKS: int = 2
 
 EXAMPLE_CONCURRENCIES: tuple[int, ...] = (1, 4, 8, 16, 32, 64, 128, 256)
 EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
@@ -233,12 +237,13 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
 }
 
 # Versioned solve JSON payload and top-K diversity selection constants.
-SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v1"
+SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
 
 # Self-contained HTML report constants.
 MAX_EMBEDDED_CANDIDATES: int = 2000
 MIN_FRONTIER_POINTS_FOR_POLYLINE: int = 2
+PREFIX_RANGE_PAIR_LEN: int = 2
 
 # Config architecture validation, hybrid patterns, and step cache constants.
 UNSUPPORTED_SSM_MODEL_TYPES: frozenset[str] = frozenset(

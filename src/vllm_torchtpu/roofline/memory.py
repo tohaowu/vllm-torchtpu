@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from .constants import (
@@ -27,6 +28,7 @@ from .constants import (
     PAGE_TABLE_BYTE_BUDGET,
     RPA_MAX_PAGE_TOKENS,
     RPA_MIN_PAGE_TOKENS,
+    STEP_FLOOR_CACHE_MAXSIZE,
 )
 from .modules import kv_bytes_per_token_per_layer
 
@@ -395,6 +397,7 @@ def _compute_kv_and_state(
     return kv_bytes, st_bytes
 
 
+@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
 def hbm_breakdown_per_core_bytes(
     geom: ModelGeometry,
     dt: Dtypes,

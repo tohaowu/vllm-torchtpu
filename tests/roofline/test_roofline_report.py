@@ -228,6 +228,55 @@ def test_render_html_clean_svg_and_assumptions_card(
     assert "; # decode" not in disagg_html
     assert "; vllm serve" not in disagg_html
 
+
+def test_report_card_renders_from_catalog(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify report card and solve payload render from the chip catalog."""
+    chip_spec = sample_payload["chip_spec"]
+    assert "jax_version" in chip_spec
+    assert isinstance(chip_spec["jax_version"], str)
+    assert bool(chip_spec["jax_version"])
+    assert "catalog" in chip_spec
+    cat = chip_spec["catalog"]
+    assert isinstance(cat, dict)
+    assert "dcn_bw" in cat
+    assert cat["dcn_bw"]["kind"] == "derived"
+    assert "source" in cat["dcn_bw"]
+    assert cat["hbm_bytes"]["display"] == "103.0 GB"
+    assert cat["bf16_flops"]["display"] == "1,155 TFLOP/s"
+    assert cat["fp8_flops"]["display"] == "2,300 TFLOP/s"
+    assert "Peak BF16 matrix-multiply throughput" in cat["bf16_flops"]["description"]
+
+    html = render_html(sample_payload)
+    assert "12.50 GB/s" in html or "12.5 GB/s" in html
+    assert "1,155 TFLOP/s" in html
+    assert "2,300 TFLOP/s" in html
+    assert "badge-fact" in html
+    assert "fact" in html.lower()
+    assert "derived" in html.lower()
+    assert "assumed" in html.lower()
+
+    custom_payload = json.loads(json.dumps(sample_payload))
+    custom_payload["chip_spec"]["dcn_bw"] = 18.75e9
+    custom_payload["chip_spec"]["pcie_bw"] = 32.0e9
+    custom_payload["chip_spec"]["catalog"]["dcn_bw"]["value"] = 18.75e9
+    custom_payload["chip_spec"]["catalog"]["pcie_bw"]["value"] = 32.0e9
+    custom_html = render_html(custom_payload)
+    assert "18.75 GB/s" in custom_html or "18.8 GB/s" in custom_html
+    assert "32.0 GB/s" in custom_html
+
+
+def test_executive_card_renders_bound_and_estimate_band(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify executive summary card renders bound ~ est TTFT and TPOT bands."""
+    html = render_html(sample_payload)
+    exec_section = html.split('id="executive-summary"', 1)[1].split("</section>", 1)[0]
+    assert "TTFT (bound ~ est)" in exec_section
+    assert "TPOT (bound ~ est)" in exec_section
+    assert " ~ " in exec_section
+
     # Assumptions card reflects chip_spec dynamically rather than hardcoding tpu7x.
     custom_chip = dc_replace(
         CHIPS["tpu7x"], name="custom_tpu_v6", hbm_bytes=32_000_000_000

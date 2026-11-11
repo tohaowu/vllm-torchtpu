@@ -824,5 +824,6 @@ def test_kv_bytes_single_source_physical_and_logical() -> None:
         )
     }
     for fam in ("gqa", "swa", "mla", "dsa"):
-        assert mods[fam].hbm_bytes_min is not None
-        assert mods[fam].hbm_bytes > mods[fam].hbm_bytes_min
+        mod = mods[fam]
+        assert mod.hbm_bytes_min is not None
+        assert mod.hbm_bytes > mod.hbm_bytes_min

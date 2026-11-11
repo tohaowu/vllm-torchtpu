@@ -11,26 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unconstrained single-pool mixed and xP/yD disaggregated TPU mesh solver."""
+"""Pareto-optimal serving topology solver across mixed and disaggregated pools."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
 from .chips import TOPOLOGIES, ChipSpec, SliceTopology
 from .collectives import submesh_for_group
 from .constants import (
+    ACTIVATION_BYTES_BF16,
     DEFAULT_GPU_MEMORY_UTILIZATION,
+    DEFAULT_HBM_RESERVE_GB,
     DEFAULT_MAX_INSTANCES,
+    DEFAULT_PREFILL_CHUNK,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
+    FP8_BYTES,
     MIN_MOE_INTERMEDIATE_ALIGNMENT,
     MIN_SLICE_CHIPS,
+    UNIT_GIBI,
     UNIT_GIGA,
-    UNIT_MICROS_PER_SECOND,
     UNIT_MILLIS_PER_SECOND,
+)
+from .crossover import (
+    prune_sweep_candidates,
+    scale_pp_stage_floor,
+    sweep_prefix_hit_crossovers,
 )
 from .memory import (
     HbmBreakdown,
@@ -43,7 +52,11 @@ from .memory import (
     smem_max_seqs,
 )
 from .modules import Dtypes, Parallel, StepShape
-from .partition import count_full_attn_layers
+from .partition import (
+    PpStageOptions,
+    count_full_attn_layers,
+    pp_stage_breakdowns,
+)
 from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 if TYPE_CHECKING:
@@ -54,7 +67,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class TrafficScenario:
-    """User-selected workload distribution and optional p90 SLO bounds."""
+    """User-selected workload distribution and optional SLO bounds."""
 
     name: str
     isl: int
@@ -64,7 +77,7 @@ class TrafficScenario:
     think_time_s: float
     concurrencies: tuple[int, ...]
     kv_working_set_turns: float
-    prefill_chunk: int = 2048
+    prefill_chunk: int = DEFAULT_PREFILL_CHUNK
     ttft_slo_ms: float | None = None
     tpot_slo_ms: float | None = None
     spec_tokens: int | None = None
@@ -123,7 +136,7 @@ EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
         accept_len=1.0,
         think_time_s=0.0,
         kv_working_set_turns=1.0,
-        prefill_chunk=2048,
+        prefill_chunk=DEFAULT_PREFILL_CHUNK,
     ),
     "reasoning-1k8k": TrafficScenario(
         name="example:reasoning-1k8k",
@@ -134,7 +147,7 @@ EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
         accept_len=1.0,
         think_time_s=0.0,
         kv_working_set_turns=1.0,
-        prefill_chunk=2048,
+        prefill_chunk=DEFAULT_PREFILL_CHUNK,
     ),
     "coding-agent": TrafficScenario(
         name="example:coding-agent",
@@ -145,7 +158,7 @@ EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
         accept_len=3.0,
         think_time_s=0.0,
         kv_working_set_turns=1.0,
-        prefill_chunk=2048,
+        prefill_chunk=DEFAULT_PREFILL_CHUNK,
         spec_tokens=3,
     ),
     "custom": TrafficScenario(
@@ -157,7 +170,7 @@ EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
         accept_len=1.0,
         think_time_s=0.0,
         kv_working_set_turns=1.0,
-        prefill_chunk=2048,
+        prefill_chunk=DEFAULT_PREFILL_CHUNK,
     ),
 }
 
@@ -253,7 +266,7 @@ class PoolMeshPlan:
     pp: int
     pcp: int
     kv_split: int
-    mesh_axes: tuple[int, ...]
+    mesh_axes: tuple[int, int, int, int]
     hbm_used_gb: float
     hbm_limit_gb: float
     moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
@@ -262,6 +275,8 @@ class PoolMeshPlan:
     hbm_state_gb: float = 0.0
     max_num_seqs: int | None = None
     max_model_len: int | None = None
+    pp_layer_partition: tuple[int, ...] | None = None
+    kv_offload_gb: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -273,14 +288,17 @@ class ParetoPoint:
     total_chips: int
     prefill_pool: PoolMeshPlan | None
     decode_pool: PoolMeshPlan
-    p90_ttft_ms: float
-    p90_tpot_ms: float
-    p90_interactivity_tok_s: float
+    est_ttft_ms: float
+    est_tpot_ms: float
+    est_interactivity_tok_s: float
     output_throughput_per_chip: float
     token_throughput_per_chip: float
     p_mixed: float
     binding: str
     slo_met: bool
+    bound_tpot_ms: float = 0.0
+    bound_ttft_ms: float = 0.0
+    slo_verdict: Literal["ruled_out", "estimate_meets", "undecided"] = "estimate_meets"
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
@@ -300,6 +318,12 @@ class ServingPlan:
     candidates: tuple[ParetoPoint, ...] = ()
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
     search: SearchStats | None = None
+    sweep_candidates: tuple[ParetoPoint, ...] = ()
+    winner_prefix_hit_range: tuple[float, float] | None = None
+    prefix_hit_crossover_rate: float | None = None
+    spec_tokens: int = 0
+    mtp_layers: int = 0
+    hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
 
 
 @dataclass(frozen=True)
@@ -311,6 +335,7 @@ class SolveOptions:
     max_instances: int | None = None
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
     topologies: tuple[SliceTopology, ...] | None = None
+    hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
 
 
 def _divisors(n: int) -> tuple[int, ...]:
@@ -515,22 +540,43 @@ def _resolve_prefill_moe(
     return moe_mode, (tp if moe_mode == "ep" else 1)
 
 
+_VERDICT_RANK: dict[str, int] = {
+    "ruled_out": 0,
+    "undecided": 1,
+    "estimate_meets": 2,
+}
+
+
 def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     """Filter points to non-dominated Pareto frontier sorted by concurrency."""
     if not points:
         return ()
+    ordered = sorted(
+        points,
+        key=lambda x: (
+            -_VERDICT_RANK[x.slo_verdict],
+            x.concurrency,
+            -x.output_throughput_per_chip,
+            -x.est_interactivity_tok_s,
+        ),
+    )
     frontier: list[ParetoPoint] = []
-    for p in points:
+    for p in ordered:
+        p_rank = _VERDICT_RANK[p.slo_verdict]
+        # Dominance is transitive across verdict tier, concurrency, throughput,
+        # and interactivity; ordered guarantees no later point dominates p.
         dominated = any(
-            q.concurrency <= p.concurrency
+            _VERDICT_RANK[q.slo_verdict] >= p_rank
+            and q.concurrency <= p.concurrency
             and q.output_throughput_per_chip >= p.output_throughput_per_chip
-            and q.p90_interactivity_tok_s >= p.p90_interactivity_tok_s
+            and q.est_interactivity_tok_s >= p.est_interactivity_tok_s
             and (
-                q.concurrency < p.concurrency
+                _VERDICT_RANK[q.slo_verdict] > p_rank
+                or q.concurrency < p.concurrency
                 or q.output_throughput_per_chip > p.output_throughput_per_chip
-                or q.p90_interactivity_tok_s > p.p90_interactivity_tok_s
+                or q.est_interactivity_tok_s > p.est_interactivity_tok_s
             )
-            for q in points
+            for q in frontier
         )
         if not dominated:
             frontier.append(p)
@@ -538,8 +584,8 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
         key=lambda x: (
             x.concurrency,
             -x.output_throughput_per_chip,
-            -x.p90_interactivity_tok_s,
-        ),
+            -x.est_interactivity_tok_s,
+        )
     )
     return tuple(frontier)
 
@@ -566,8 +612,19 @@ class _SolveContext:
     n_chunks: int
     page_size: int
     c_max: int
+    hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     enumerated: int = 0
     hbm_fit: int = 0
+    decode_floor_cache: dict[tuple[str, Parallel, int], StepFloor] = field(
+        default_factory=dict
+    )
+    kv_fit_cache: dict[tuple[Parallel, int, int, float], tuple[float, float]] = field(
+        default_factory=dict
+    )
+    clamp_batch_cache: dict[tuple[Parallel, int], tuple[int, HbmBreakdown] | None] = (
+        field(default_factory=dict)
+    )
+    xfer_cache: dict[tuple[str, str, int], float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -580,6 +637,8 @@ class _PrefillOption:
     rate_p: float
     hbm_gb: float
     hbm_bd: HbmBreakdown
+    pp_part: tuple[int, ...] | None = None
+    bound_ttft_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -624,6 +683,8 @@ class _DisaggBatchStats:
     b_local: int
     ttft_eff_ms: float
     rate_p_eff: float
+    h_eff: float = 0.0
+    bound_ttft_p_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -641,13 +702,40 @@ class _PoolPlanInput:
     hbm_weights_gb: float = 0.0
     hbm_kv_gb: float = 0.0
     hbm_state_gb: float = 0.0
+    pp_layer_partition: tuple[int, ...] | None = None
+    kv_offload_gb: float = 0.0
+
+
+@dataclass(frozen=True)
+class _MixedLoopInput:
+    """Inputs for solving the mixed prefill-decode Little's-law fixed point."""
+
+    b_res: int
+    n_chunks_c: int
+    chunk_tok_c: int
+    ttft_service_s: float
+    pcie_read_s: float
+
+
+@dataclass(frozen=True)
+class _MixedLoopOutput:
+    """Solved fixed-point mixed step floors, latencies, and request rate."""
+
+    sf_dec: StepFloor
+    sf_mix: StepFloor
+    p_mix: float
+    est_ttft_ms: float
+    est_tpot_ms: float
+    x_rate: float
 
 
 def _floor_times(sf: StepFloor) -> FloorTimes:
-    """Extract decode-step resource times (ms) from a StepFloor."""
+    """Decode-step resource times (ms) behind a point's binding unit."""
+    hbm_t = sf.hbm_bound_s if sf.hbm_bound_s > 0.0 else sf.hbm_s
+    mm_t = sf.mm_bound_s if sf.mm_bound_s > 0.0 else sf.mm_s
     return FloorTimes(
-        hbm_ms=sf.hbm_s * UNIT_MILLIS_PER_SECOND,
-        matmul_ms=sf.mm_s * UNIT_MILLIS_PER_SECOND,
+        hbm_ms=hbm_t * UNIT_MILLIS_PER_SECOND,
+        matmul_ms=mm_t * UNIT_MILLIS_PER_SECOND,
         ici_ms=sf.ici_s * UNIT_MILLIS_PER_SECOND,
         chain_ms=sf.chain_s * UNIT_MILLIS_PER_SECOND,
         hop_latency_ms=sf.lat_s * UNIT_MILLIS_PER_SECOND,
@@ -683,7 +771,86 @@ def _build_pool_mesh_plan(spec: _PoolPlanInput) -> PoolMeshPlan:
         hbm_state_gb=spec.hbm_state_gb,
         max_num_seqs=spec.max_num_seqs,
         max_model_len=spec.max_model_len,
+        pp_layer_partition=spec.pp_layer_partition,
+        kv_offload_gb=spec.kv_offload_gb,
     )
+
+
+def _peak_prefill_logit_bytes(
+    geom: ModelGeometry,
+    dtypes: Dtypes,
+    par: Parallel,
+    chunk_rows: int,
+    *,
+    sampled_rows: int = 1,
+) -> float:
+    """Return estimated peak HBM buffer bytes for prefill logit and activation."""
+    if (chunk_rows <= 0 and sampled_rows <= 0) or geom.vocab <= 0:
+        return 0.0
+    tp = max(1, par.tp)
+    rows_local = math.ceil(max(0, chunk_rows) / max(1, par.pcp))
+    n_samp = max(1, sampled_rows) if chunk_rows > 0 else max(0, sampled_rows)
+    act_b = ACTIVATION_BYTES_BF16 if dtypes.act == "a16" else FP8_BYTES
+    logit_b = max(act_b, dtypes.lm_head)
+    return (
+        float(n_samp) * (float(geom.vocab) / float(tp)) * logit_b
+        + float(rows_local) * float(geom.hidden) * act_b
+    )
+
+
+def _disagg_kv_xfer_s(
+    geom: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    topos: tuple[SliceTopology, SliceTopology],
+    uncached_tokens: int,
+) -> float:
+    """Return transfer time in seconds to migrate KV cache over DCN between pools."""
+    if chip.dcn_bw <= 0.0 or not math.isfinite(chip.dcn_bw):
+        return 0.0
+    bd_one = hbm_breakdown_per_core_bytes(
+        geom,
+        dtypes,
+        Parallel(tp=1, pp=1),
+        SeqKvLayout(1, max(0, uncached_tokens), physical_kv_layout=False),
+    )
+    wire_b = bd_one.kv + bd_one.state
+    topo_p, topo_d = topos
+    denom = float(max(1, min(topo_p.num_chips, topo_d.num_chips))) * chip.dcn_bw
+    return wire_b / denom
+
+
+def _pcie_read_s(
+    ctx: _SolveContext,
+    b_kv_phys: float,
+    h_eff: float,
+    h_hbm_only: float,
+) -> float:
+    """Compute host PCIe offload read time in seconds for spilled KV prefix tokens."""
+    offload_read_b = max(0.0, h_eff - h_hbm_only) * float(ctx.scenario.isl) * b_kv_phys
+    pcie_core_bw = ctx.chip.pcie_bw / float(max(1, ctx.chip.cores_per_chip))
+    if offload_read_b > 0.0 and pcie_core_bw > 0.0 and math.isfinite(pcie_core_bw):
+        return offload_read_b / pcie_core_bw
+    return 0.0
+
+
+def _resolve_slo_verdict(
+    scen: TrafficScenario,
+    est_ttft_ms: float,
+    est_tpot_ms: float,
+    bound_ttft_ms: float,
+    bound_tpot_ms: float,
+) -> tuple[Literal["ruled_out", "estimate_meets", "undecided"], bool]:
+    """Classify hard-bound vs modeled-estimate SLO feasibility verdict."""
+    slo_ruled_out = (
+        scen.ttft_slo_ms is not None and bound_ttft_ms > scen.ttft_slo_ms
+    ) or (scen.tpot_slo_ms is not None and bound_tpot_ms > scen.tpot_slo_ms)
+    if slo_ruled_out:
+        return ("ruled_out", False)
+    est_ok = (scen.ttft_slo_ms is None or est_ttft_ms <= scen.ttft_slo_ms) and (
+        scen.tpot_slo_ms is None or est_tpot_ms <= scen.tpot_slo_ms
+    )
+    return ("estimate_meets" if est_ok else "undecided", True)
 
 
 def _eval_decode_floor(
@@ -693,22 +860,30 @@ def _eval_decode_floor(
     batch: int,
 ) -> StepFloor:
     """Evaluate single-step or speculative-cycle floor at midpoint context."""
+    key = (topo.name, par, batch)
+    cached = ctx.decode_floor_cache.get(key)
+    if cached is not None:
+        return cached
     opts = FloorOptions(dt=ctx.dtypes, topology=topo)
-    if ctx.spec_k > 0:
-        return spec_cycle_floor(
+    sf = (
+        spec_cycle_floor(
             ctx.geom,
             ctx.chip,
             par,
             SpecShape(batch=batch, context=ctx.ctx_mid, k=ctx.spec_k),
             opts,
         )
-    return step_floor(
-        ctx.geom,
-        ctx.chip,
-        par,
-        StepShape(batch=batch, context=ctx.ctx_mid),
-        opts,
+        if ctx.spec_k > 0
+        else step_floor(
+            ctx.geom,
+            ctx.chip,
+            par,
+            StepShape(batch=batch, context=ctx.ctx_mid),
+            opts,
+        )
     )
+    ctx.decode_floor_cache[key] = sf
+    return sf
 
 
 def _prefill_step_floor(
@@ -751,7 +926,44 @@ def _clamp_resident_batch(
         )
     if hbm_bd.total > ctx.hbm_limit_b:
         return None
-    return b_res, hbm_bd
+    return (b_res, hbm_bd)
+
+
+def _resolve_prefill_pp_breakdown(
+    ctx: _SolveContext,
+    par: Parallel,
+    logit_peak_b: float,
+) -> tuple[HbmBreakdown, float, tuple[int, ...] | None] | None:
+    """Resolve prefill stage HBM breakdown and optional uneven PP partition."""
+    if par.pp <= 1:
+        hbm_bd = hbm_breakdown_per_core_bytes(
+            ctx.geom, ctx.dtypes, par, SeqKvLayout(1, ctx.scenario.isl)
+        )
+        return (hbm_bd, hbm_bd.total, None)
+    even_cap = max(1, math.ceil(ctx.geom.num_layers / par.pp))
+    pp_part, hbm_bd, last_stage_b, pp_feas = pp_stage_breakdowns(
+        ctx.geom,
+        ctx.dtypes,
+        par,
+        (ctx.scenario.isl, 1),
+        PpStageOptions(disagg=True, max_stage_layers=even_cap),
+    )
+    if (
+        not pp_feas
+        or hbm_bd.total > ctx.hbm_limit_b
+        or (last_stage_b + logit_peak_b) > ctx.hbm_limit_b
+    ):
+        pp_part, hbm_bd, last_stage_b, pp_feas = pp_stage_breakdowns(
+            ctx.geom,
+            ctx.dtypes,
+            par,
+            (ctx.scenario.isl, 1),
+            PpStageOptions(disagg=True),
+        )
+    if not pp_feas:
+        return None
+    pp_part_opt = pp_part if len(set(pp_part)) > 1 else None
+    return (hbm_bd, last_stage_b, pp_part_opt)
 
 
 def _find_prefill_options(
@@ -761,26 +973,42 @@ def _find_prefill_options(
     """Find fastest legal prefill configurations grouped by GDN compatibility class."""
     prefill_options: list[_PrefillOption] = []
     min_req_ttft_ms = math.inf
+    pre_chunk_rows = min(ctx.eff_isl, ctx.scenario.prefill_chunk)
     for topo in topos:
         best_by_class: dict[tuple[int, bool], _PrefillOption] = {}
         for par in _candidate_prefill_parallels(ctx.geom, topo, for_disagg=True):
-            hbm_bd = hbm_breakdown_per_core_bytes(
-                ctx.geom,
-                ctx.dtypes,
-                par,
-                SeqKvLayout(1, ctx.scenario.isl),
+            logit_peak_b = _peak_prefill_logit_bytes(
+                ctx.geom, ctx.dtypes, par, pre_chunk_rows, sampled_rows=1
             )
-            hbm_b = hbm_bd.total
-            if hbm_b > ctx.hbm_limit_b:
+            stage_info = _resolve_prefill_pp_breakdown(ctx, par, logit_peak_b)
+            if stage_info is None:
                 continue
-            sf_p = _prefill_step_floor(ctx, topo, par, ctx.scenario.prefix_hit_rate)
+            hbm_bd, last_stage_b, pp_part_opt = stage_info
+            hbm_b = hbm_bd.total
+            if (
+                hbm_b > ctx.hbm_limit_b
+                or (last_stage_b + logit_peak_b) > ctx.hbm_limit_b
+            ):
+                continue
+
+            sf_p_raw = _prefill_step_floor(ctx, topo, par, ctx.scenario.prefix_hit_rate)
+            sf_p = scale_pp_stage_floor(sf_p_raw, pp_part_opt, ctx.chip, par, topo)
             ttft_ms = (
-                sf_p.serial_floor_s
+                sf_p.serial_estimate_s
                 * (1.0 + float(par.pp - 1) / float(max(1, ctx.n_chunks)))
                 * UNIT_MILLIS_PER_SECOND
             )
-            min_req_ttft_ms = min(min_req_ttft_ms, ttft_ms)
-            rate_p = 1.0 / max(1e-9, sf_p.serial_floor_s)
+            xfer_min_ms = (
+                0.0
+                if ctx.mode in ("auto", "mixed")
+                else _disagg_kv_xfer_s(
+                    ctx.geom, ctx.dtypes, ctx.chip, (topo, topo), ctx.eff_isl
+                )
+                * UNIT_MILLIS_PER_SECOND
+            )
+            min_req_ttft_ms = min(min_req_ttft_ms, ttft_ms + xfer_min_ms)
+
+            rate_p = 1.0 / max(1e-9, sf_p.serial_estimate_s)
             cls_key = (par.tp * par.pcp, par.pp > 1)
             prev = best_by_class.get(cls_key)
             if prev is None or rate_p > prev.rate_p:
@@ -791,9 +1019,11 @@ def _find_prefill_options(
                     rate_p=rate_p,
                     hbm_gb=hbm_b / UNIT_GIGA,
                     hbm_bd=hbm_bd,
+                    pp_part=pp_part_opt,
+                    bound_ttft_ms=sf_p.hard_floor_s * UNIT_MILLIS_PER_SECOND,
                 )
         prefill_options.extend(best_by_class.values())
-    return prefill_options, min_req_ttft_ms
+    return (prefill_options, min_req_ttft_ms)
 
 
 def _solve_mixed_think_batch(
@@ -810,29 +1040,136 @@ def _solve_mixed_think_batch(
         return b_local
     for _ in range(2):
         sf_dec_tmp = _eval_decode_floor(ctx, topo, par, b_local)
-        w_srv = sf_ttft.serial_floor_s + dec_steps_per_req * sf_dec_tmp.serial_floor_s
+        w_srv = (
+            sf_ttft.serial_estimate_s + dec_steps_per_req * sf_dec_tmp.serial_estimate_s
+        )
         c_act = float(c) * w_srv / (w_srv + ctx.scenario.think_time_s)
         b_local = max(1, math.ceil(c_act / max(1, par.dp)))
     return b_local
 
 
-def _fit_mixed_resident_batch(
+def _fit_mixed_batch_with_logits(
     ctx: _SolveContext,
     topo: SliceTopology,
     par: Parallel,
     c: int,
     bounds: _MixedPointBounds,
 ) -> tuple[int, int, HbmBreakdown] | None:
-    """Compute active local batch and HBM-fitting resident batch."""
+    """Compute active local batch and HBM-fitting resident batch with logit peak."""
     b_local = _solve_mixed_think_batch(ctx, topo, par, c, bounds.sf_ttft)
-    b_start = min(b_local, bounds.b_hbm_max, bounds.b_smem_max)
+    b_res = min(b_local, bounds.b_hbm_max, bounds.b_smem_max)
     if ctx.scenario.max_num_seqs is not None:
-        b_start = min(b_start, ctx.scenario.max_num_seqs)
-    clamped = _clamp_resident_batch(ctx, par, b_start)
-    if clamped is None:
+        b_res = min(b_res, ctx.scenario.max_num_seqs)
+    pre_chunk_rows = min(ctx.eff_isl, ctx.scenario.prefill_chunk)
+    row_mul = max(1, ctx.spec_k + 1)
+    hbm_bd = hbm_breakdown_per_core_bytes(
+        ctx.geom, ctx.dtypes, par, SeqKvLayout(b_res, ctx.ctx_full)
+    )
+    logit_peak_b = _peak_prefill_logit_bytes(
+        ctx.geom, ctx.dtypes, par, pre_chunk_rows, sampled_rows=b_res * row_mul
+    )
+    while b_res > 1 and (hbm_bd.total + logit_peak_b) > ctx.hbm_limit_b:
+        b_res -= 1
+        hbm_bd = hbm_breakdown_per_core_bytes(
+            ctx.geom, ctx.dtypes, par, SeqKvLayout(b_res, ctx.ctx_full)
+        )
+        logit_peak_b = _peak_prefill_logit_bytes(
+            ctx.geom, ctx.dtypes, par, pre_chunk_rows, sampled_rows=b_res * row_mul
+        )
+    if (hbm_bd.total + logit_peak_b) > ctx.hbm_limit_b:
         return None
-    b_res, hbm_bd = clamped
-    return b_local, b_res, hbm_bd
+    return (b_local, b_res, hbm_bd)
+
+
+def _solve_mixed_decode_fixed_point(
+    ctx: _SolveContext,
+    topo: SliceTopology,
+    par: Parallel,
+    c: int,
+    loop_in: _MixedLoopInput,
+) -> _MixedLoopOutput:
+    """Solve 3-step Little's-law fixed point for mixed prefill-decode serving."""
+    eff_al = ctx.eff_al
+    think = ctx.scenario.think_time_s
+    osl = float(ctx.scenario.osl)
+    dec_steps_per_req = max(1.0, osl / eff_al)
+    dp_val = max(1, par.dp)
+    max_decode_seqs = float(loop_in.b_res * dp_val)
+    b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), float(c)))
+    opts = FloorOptions(dt=ctx.dtypes, topology=topo)
+
+    sf_dec = _eval_decode_floor(ctx, topo, par, 1)
+    sf_mix = sf_dec
+    p_mix = 0.0
+    tpot_s = 0.0
+    t_dec_s = 0.0
+    x_capacity = 0.0
+    for _ in range(3):
+        b_replica = max(1, min(loop_in.b_res, math.ceil(b_dec / float(dp_val))))
+        sf_dec = _eval_decode_floor(ctx, topo, par, b_replica)
+        sf_ver_only = (
+            step_floor(
+                ctx.geom,
+                ctx.chip,
+                par,
+                StepShape(
+                    batch=b_replica,
+                    rows_per_seq=ctx.spec_k + 1,
+                    context=ctx.ctx_mid,
+                    state_writes=1,
+                ),
+                opts,
+            )
+            if ctx.spec_k > 0
+            else sf_dec
+        )
+        draft_serial_s = max(
+            0.0, sf_dec.serial_estimate_s - sf_ver_only.serial_estimate_s
+        )
+        sf_mix = step_floor(
+            ctx.geom,
+            ctx.chip,
+            par,
+            StepShape(
+                batch=b_replica,
+                rows_per_seq=ctx.spec_k + 1,
+                context=ctx.ctx_mid,
+                state_writes=1,
+                prefill_tokens=loop_in.chunk_tok_c,
+                prefix_hit_rate=0.0,
+            ),
+            opts,
+        )
+        mix_serial_s = sf_mix.serial_estimate_s + draft_serial_s
+        bn = float(b_replica * loop_in.n_chunks_c)
+        p_mix = min(1.0, bn / max(1.0, dec_steps_per_req + bn))
+        est_step_s = (1.0 - p_mix) * sf_dec.serial_estimate_s + p_mix * mix_serial_s
+        tpot_s = est_step_s / eff_al
+        t_dec_s = osl * tpot_s
+        total_req_work_s = (
+            dec_steps_per_req * sf_dec.serial_estimate_s
+            + float(loop_in.b_res * loop_in.n_chunks_c) * mix_serial_s
+            + float(loop_in.b_res) * loop_in.pcie_read_s
+        )
+        x_capacity = max_decode_seqs / max(1e-9, total_req_work_s)
+        x_rate = min(
+            x_capacity,
+            float(c) / max(1e-9, loop_in.ttft_service_s + t_dec_s + think),
+        )
+        b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), x_rate * t_dec_s))
+    x_rate = min(
+        x_capacity,
+        float(c) / max(1e-9, loop_in.ttft_service_s + t_dec_s + think),
+    )
+    ttft_est_s = float(c) / max(1e-9, x_rate) - t_dec_s - think
+    return _MixedLoopOutput(
+        sf_dec=sf_dec,
+        sf_mix=sf_mix,
+        p_mix=p_mix,
+        est_ttft_ms=ttft_est_s * UNIT_MILLIS_PER_SECOND,
+        est_tpot_ms=tpot_s * UNIT_MILLIS_PER_SECOND,
+        x_rate=x_rate,
+    )
 
 
 def _evaluate_mixed_point(
@@ -845,15 +1182,15 @@ def _evaluate_mixed_point(
     """Evaluate one concurrency target for a single-pool mixed serving configuration."""
     if bounds.b_hbm_max < 1 or bounds.b_smem_max < 1:
         return None
-    dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
-    offload_b_per_core = (
-        float(ctx.scenario.kv_offload_gb) * UNIT_GIGA / float(max(1, topo.num_cores))
-    )
-    fitted = _fit_mixed_resident_batch(ctx, topo, par, c, bounds)
+    fitted = _fit_mixed_batch_with_logits(ctx, topo, par, c, bounds)
     if fitted is None:
         return None
     b_local, b_res, hbm_bd = fitted
     hbm_b = hbm_bd.total
+
+    offload_b_per_core = (
+        float(ctx.scenario.kv_offload_gb) * UNIT_GIBI / float(max(1, par.tp * par.pp))
+    )
     ctx.hbm_fit += 1
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         ctx.geom,
@@ -877,78 +1214,57 @@ def _evaluate_mixed_point(
         if h_eff != ctx.scenario.prefix_hit_rate
         else bounds.sf_ttft
     )
+    _, h_hbm_only = kv_capacity_and_hit_rate(
+        ctx.geom,
+        ctx.dtypes,
+        par,
+        b_res,
+        KvFitInput(
+            b_ws=b_local,
+            ctx_full=ctx.ctx_full,
+            hbm_limit_b=ctx.hbm_limit_b,
+            w_base_b=bounds.w_base_b,
+            b_kv_phys_core=bounds.b_kv_phys_core,
+            offload_b_per_core=0.0,
+            prefix_hit_rate=ctx.scenario.prefix_hit_rate,
+            kv_working_set_turns=ctx.scenario.kv_working_set_turns,
+        ),
+    )
+    pcie_read_s = _pcie_read_s(ctx, bounds.b_kv_phys_core, h_eff, h_hbm_only)
+    ttft_service_s = sf_ttft_c.serial_estimate_s + pcie_read_s
+    bound_ttft_ms = sf_ttft_c.hard_floor_s * UNIT_MILLIS_PER_SECOND
+
     eff_isl_c = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
     n_chunks_c = max(1, math.ceil(eff_isl_c / max(1, ctx.scenario.prefill_chunk)))
     chunk_tok_c = min(eff_isl_c, ctx.scenario.prefill_chunk)
-    sf_dec = _eval_decode_floor(ctx, topo, par, b_res)
-    sf_ver_only = (
-        step_floor(
-            ctx.geom,
-            ctx.chip,
-            par,
-            StepShape(
-                batch=b_res,
-                rows_per_seq=ctx.spec_k + 1,
-                context=ctx.ctx_mid,
-                state_writes=1,
-            ),
-            FloorOptions(dt=ctx.dtypes, topology=topo),
-        )
-        if ctx.spec_k > 0
-        else sf_dec
-    )
-    draft_serial_s = max(0.0, sf_dec.serial_floor_s - sf_ver_only.serial_floor_s)
-    sf_mix = step_floor(
-        ctx.geom,
-        ctx.chip,
+
+    solved = _solve_mixed_decode_fixed_point(
+        ctx,
+        topo,
         par,
-        StepShape(
-            batch=b_res,
-            rows_per_seq=ctx.spec_k + 1,
-            context=ctx.ctx_mid,
-            state_writes=1,
-            prefill_tokens=chunk_tok_c,
-            prefix_hit_rate=0.0,
+        c,
+        _MixedLoopInput(
+            b_res=b_res,
+            n_chunks_c=n_chunks_c,
+            chunk_tok_c=chunk_tok_c,
+            ttft_service_s=ttft_service_s,
+            pcie_read_s=pcie_read_s,
         ),
-        FloorOptions(dt=ctx.dtypes, topology=topo),
     )
-    mix_serial_s = sf_mix.serial_floor_s + draft_serial_s
-    total_req_work_s = (
-        dec_steps_per_req * sf_dec.serial_floor_s
-        + float(b_res * n_chunks_c) * mix_serial_s
+    interactivity = UNIT_MILLIS_PER_SECOND / max(1e-9, solved.est_tpot_ms)
+    out_tput = (solved.x_rate * float(ctx.scenario.osl)) / float(topo.num_chips)
+    tot_tput = (solved.x_rate * float(ctx.scenario.isl + ctx.scenario.osl)) / float(
+        topo.num_chips
     )
-    res_cap = float(b_res * max(1, par.dp))
-    c_served = min(float(c), res_cap)
-    server_cap_rate = res_cap / max(1e-9, total_req_work_s)
-    w_srv_final = sf_ttft_c.serial_floor_s + dec_steps_per_req * sf_dec.serial_floor_s
-    rate_req_s = (
-        min(
-            server_cap_rate,
-            float(c) / max(1e-9, w_srv_final + ctx.scenario.think_time_s),
-        )
-        if ctx.scenario.think_time_s > 0.0
-        else c_served / max(1e-9, total_req_work_s)
+    bound_tpot_ms = (solved.sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND) / ctx.eff_al
+    verdict, slo_ok = _resolve_slo_verdict(
+        ctx.scenario,
+        solved.est_ttft_ms,
+        solved.est_tpot_ms,
+        bound_ttft_ms,
+        bound_tpot_ms,
     )
-    p_mix = min(
-        1.0,
-        float(b_res * n_chunks_c)
-        / float(max(1.0, dec_steps_per_req + float(b_res * n_chunks_c))),
-    )
-    p90_step_s = (1.0 - p_mix) * sf_dec.serial_floor_s + p_mix * mix_serial_s
-    p90_tpot_ms = p90_step_s * UNIT_MILLIS_PER_SECOND / ctx.eff_al
-    c_demand = min(float(c), float(b_local * max(1, par.dp)))
-    queue_wait_s = max(0.0, (c_demand / max(1e-9, res_cap)) - 1.0) * w_srv_final
-    p90_ttft_ms = (sf_ttft_c.serial_floor_s + queue_wait_s) * UNIT_MILLIS_PER_SECOND + (
-        sf_mix.serial_floor_s * UNIT_MILLIS_PER_SECOND if c > 1 else 0.0
-    )
-    interactivity = UNIT_MILLIS_PER_SECOND / max(1e-6, p90_tpot_ms)
-    out_tput = rate_req_s * float(ctx.scenario.osl) / float(topo.num_chips)
-    tot_tput = (
-        rate_req_s * float(ctx.scenario.isl + ctx.scenario.osl) / float(topo.num_chips)
-    )
-    slo_ok = (
-        ctx.scenario.ttft_slo_ms is None or p90_ttft_ms <= ctx.scenario.ttft_slo_ms
-    ) and (ctx.scenario.tpot_slo_ms is None or p90_tpot_ms <= ctx.scenario.tpot_slo_ms)
+
     max_seqs_flag = b_res if b_res < b_local else ctx.scenario.max_num_seqs
     pool = _build_pool_mesh_plan(
         _PoolPlanInput(
@@ -963,10 +1279,14 @@ def _evaluate_mixed_point(
             hbm_weights_gb=hbm_bd.weights / UNIT_GIGA,
             hbm_kv_gb=hbm_bd.kv / UNIT_GIGA,
             hbm_state_gb=hbm_bd.state / UNIT_GIGA,
+            pp_layer_partition=None,
+            kv_offload_gb=ctx.scenario.kv_offload_gb,
         )
     )
     binding = (
-        f"dec:{sf_dec.binding},mix:{sf_mix.binding}" if p_mix > 0.0 else sf_dec.binding
+        f"dec:{solved.sf_dec.binding},mix:{solved.sf_mix.binding}"
+        if solved.p_mix > 0.0
+        else solved.sf_dec.binding
     )
     return ParetoPoint(
         mode="mixed",
@@ -974,15 +1294,18 @@ def _evaluate_mixed_point(
         total_chips=topo.num_chips,
         prefill_pool=None,
         decode_pool=pool,
-        p90_ttft_ms=p90_ttft_ms,
-        p90_tpot_ms=p90_tpot_ms,
-        p90_interactivity_tok_s=interactivity,
+        est_ttft_ms=solved.est_ttft_ms,
+        est_tpot_ms=solved.est_tpot_ms,
+        est_interactivity_tok_s=interactivity,
         output_throughput_per_chip=out_tput,
         token_throughput_per_chip=tot_tput,
-        p_mixed=p_mix,
+        p_mixed=solved.p_mix,
         binding=binding,
         slo_met=slo_ok,
-        decode_floor=_floor_times(sf_dec),
+        bound_tpot_ms=bound_tpot_ms,
+        bound_ttft_ms=bound_ttft_ms,
+        slo_verdict=verdict,
+        decode_floor=_floor_times(solved.sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -991,6 +1314,8 @@ def _evaluate_mixed_point(
 def _decode_capacity_profile(
     ctx: _SolveContext,
     par: Parallel,
+    *,
+    logit_peak_b: float = 0.0,
 ) -> tuple[float, int, int, float, float]:
     """Compute (w_base_b, b_hbm_max, b_smem_max, b_kv_phys_core, hbm_c1)."""
     w_base_b = hbm_footprint_per_core_bytes(
@@ -1000,16 +1325,17 @@ def _decode_capacity_profile(
         ctx.geom, ctx.dtypes, par, SeqKvLayout(1, ctx.ctx_full)
     )
     per_seq_b = hbm_c1 - w_base_b
+    fits_c1 = (hbm_c1 + logit_peak_b) <= ctx.hbm_limit_b
     b_hbm_max = (
         int((ctx.hbm_limit_b - w_base_b) // per_seq_b)
-        if (hbm_c1 <= ctx.hbm_limit_b and per_seq_b > 0.0)
-        else (ctx.c_max if hbm_c1 <= ctx.hbm_limit_b else 0)
+        if (fits_c1 and per_seq_b > 0.0)
+        else (ctx.c_max if fits_c1 else 0)
     )
     b_smem_max = smem_max_seqs(ctx.ctx_full, par.kv_split, ctx.page_size)
     b_kv_phys_core = hbm_footprint_per_core_bytes(
         ctx.geom, ctx.dtypes, par, SeqKvLayout(1, 1)
     ) - hbm_footprint_per_core_bytes(ctx.geom, ctx.dtypes, par, SeqKvLayout(1, 0))
-    return w_base_b, b_hbm_max, b_smem_max, b_kv_phys_core, hbm_c1
+    return (w_base_b, b_hbm_max, b_smem_max, b_kv_phys_core, hbm_c1)
 
 
 def _evaluate_mixed_candidates(
@@ -1020,22 +1346,27 @@ def _evaluate_mixed_candidates(
     candidates: list[ParetoPoint] = []
     min_c1_tpot_ms = math.inf
     min_req_ttft_ms = math.inf
+    pre_chunk_rows = min(ctx.eff_isl, ctx.scenario.prefill_chunk)
+    c1_rows = max(1, ctx.spec_k + 1)
     for topo in topos:
         for par in _candidate_decode_parallels(ctx.geom, topo):
-            w_base_b, b_hbm_max, b_smem_max, b_kv_phys_core, hbm_c1 = (
-                _decode_capacity_profile(ctx, par)
+            logit_peak_mix_b = _peak_prefill_logit_bytes(
+                ctx.geom, ctx.dtypes, par, pre_chunk_rows, sampled_rows=c1_rows
             )
-            if hbm_c1 <= ctx.hbm_limit_b and b_smem_max >= 1:
+            w_base_b, b_hbm_max, b_smem_max, b_kv_phys_core, hbm_c1 = (
+                _decode_capacity_profile(ctx, par, logit_peak_b=logit_peak_mix_b)
+            )
+            if (hbm_c1 + logit_peak_mix_b) <= ctx.hbm_limit_b and b_smem_max >= 1:
                 sf_c1 = _eval_decode_floor(ctx, topo, par, 1)
                 min_c1_tpot_ms = min(
                     min_c1_tpot_ms,
-                    sf_c1.serial_floor_s * UNIT_MILLIS_PER_SECOND / ctx.eff_al,
+                    sf_c1.serial_estimate_s * UNIT_MILLIS_PER_SECOND / ctx.eff_al,
                 )
             if ctx.mode not in ("auto", "mixed"):
                 continue
             sf_ttft = _prefill_step_floor(ctx, topo, par, ctx.scenario.prefix_hit_rate)
             min_req_ttft_ms = min(
-                min_req_ttft_ms, sf_ttft.serial_floor_s * UNIT_MILLIS_PER_SECOND
+                min_req_ttft_ms, sf_ttft.serial_estimate_s * UNIT_MILLIS_PER_SECOND
             )
             bounds = _MixedPointBounds(
                 w_base_b=w_base_b,
@@ -1049,49 +1380,99 @@ def _evaluate_mixed_candidates(
                 pt = _evaluate_mixed_point(ctx, topo, par, c, bounds)
                 if pt is not None:
                     candidates.append(pt)
-    return candidates, min_c1_tpot_ms, min_req_ttft_ms
+    return (candidates, min_c1_tpot_ms, min_req_ttft_ms)
 
 
 def _compute_disagg_metrics(
     ctx: _SolveContext,
     dec: _DisaggDecodeState,
+    pref: _PrefillOption,
     target: _DisaggRatioTarget,
     batch_stats: _DisaggBatchStats,
-    sf_d: StepFloor,
-) -> tuple[float, float, float, float, float]:
-    """Compute serving latencies and throughputs for disaggregated configuration."""
+) -> tuple[float, float, float, float, float, StepFloor]:
+    """Solve coupled Little's-law fixed point for a disaggregated candidate."""
     dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
-    p90_tpot_ms = sf_d.serial_floor_s * UNIT_MILLIS_PER_SECOND / ctx.eff_al
-    interactivity = UNIT_MILLIS_PER_SECOND / max(1e-6, p90_tpot_ms)
-    res_cap_d = float(batch_stats.b_res * max(1, target.y_d * dec.par.dp))
-    c_served_d = min(float(target.c), res_cap_d)
-    rate_d_cap = c_served_d / (dec_steps_per_req * max(1e-9, sf_d.serial_floor_s))
-    c_demand_d = min(
-        float(target.c), float(batch_stats.b_local * max(1, target.y_d * dec.par.dp))
-    )
-    queue_wait_d_ms = (
-        max(0.0, (c_demand_d / max(1e-9, res_cap_d)) - 1.0)
-        * (dec_steps_per_req * sf_d.serial_floor_s)
+    eff_al = ctx.eff_al
+    think = ctx.scenario.think_time_s
+    osl = float(ctx.scenario.osl)
+    idp_val = max(1, target.y_d * dec.par.dp)
+    max_decode_seqs = float(batch_stats.b_res * idp_val)
+
+    kv_key_d = (dec.par, batch_stats.b_res, batch_stats.b_local, 0.0)
+    cached_kv_d = ctx.kv_fit_cache.get(kv_key_d)
+    if cached_kv_d is None:
+        cached_kv_d = kv_capacity_and_hit_rate(
+            ctx.geom,
+            ctx.dtypes,
+            dec.par,
+            batch_stats.b_res,
+            KvFitInput(
+                b_ws=batch_stats.b_local,
+                ctx_full=ctx.ctx_full,
+                hbm_limit_b=ctx.hbm_limit_b,
+                w_base_b=dec.w_base_b,
+                b_kv_phys_core=dec.b_kv_phys,
+                offload_b_per_core=0.0,
+                prefix_hit_rate=ctx.scenario.prefix_hit_rate,
+                kv_working_set_turns=ctx.scenario.kv_working_set_turns,
+            ),
+        )
+        ctx.kv_fit_cache[kv_key_d] = cached_kv_d
+    _, h_hbm_d = cached_kv_d
+    pcie_d_ms = (
+        _pcie_read_s(ctx, dec.b_kv_phys, batch_stats.h_eff, h_hbm_d)
         * UNIT_MILLIS_PER_SECOND
     )
-    p90_ttft_d_ms = batch_stats.ttft_eff_ms + queue_wait_d_ms
-    if ctx.scenario.think_time_s > 0.0:
-        client_rate = float(target.c) / max(
-            1e-9,
-            batch_stats.ttft_eff_ms * UNIT_MICROS_PER_SECOND * UNIT_MILLIS_PER_SECOND
-            + dec_steps_per_req * sf_d.serial_floor_s
-            + ctx.scenario.think_time_s,
+    uncached_d_tok = max(1, math.ceil((1.0 - batch_stats.h_eff) * ctx.scenario.isl))
+    xfer_key = (pref.topo.name, dec.topo.name, uncached_d_tok)
+    xfer_s = ctx.xfer_cache.get(xfer_key)
+    if xfer_s is None:
+        xfer_s = _disagg_kv_xfer_s(
+            ctx.geom,
+            ctx.dtypes,
+            ctx.chip,
+            (pref.topo, dec.topo),
+            uncached_d_tok,
         )
-        coupled_rate = min(target.x_p * batch_stats.rate_p_eff, rate_d_cap, client_rate)
-    else:
-        coupled_rate = min(target.x_p * batch_stats.rate_p_eff, rate_d_cap)
-    out_tput = coupled_rate * float(ctx.scenario.osl) / float(target.total_chips)
-    tot_tput = (
-        coupled_rate
-        * float(ctx.scenario.isl + ctx.scenario.osl)
-        / float(target.total_chips)
+        ctx.xfer_cache[xfer_key] = xfer_s
+    kv_xfer_ms = xfer_s * UNIT_MILLIS_PER_SECOND
+    ttft_service_s = (
+        batch_stats.ttft_eff_ms + pcie_d_ms + kv_xfer_ms
+    ) / UNIT_MILLIS_PER_SECOND
+
+    b_dec = max(1.0, min(float(min(target.c, int(max_decode_seqs))), float(target.c)))
+    sf_d = _eval_decode_floor(ctx, dec.topo, dec.par, 1)
+    tpot_s = 0.0
+    t_dec_s = 0.0
+    x_capacity = 0.0
+    for _ in range(3):
+        b_replica = max(1, min(batch_stats.b_res, math.ceil(b_dec / float(idp_val))))
+        sf_d = _eval_decode_floor(ctx, dec.topo, dec.par, b_replica)
+        tpot_s = sf_d.serial_estimate_s / eff_al
+        t_dec_s = osl * tpot_s
+        rate_d_cap = float(batch_stats.b_res * idp_val) / (
+            dec_steps_per_req * max(1e-9, sf_d.serial_estimate_s)
+        )
+        x_capacity = min(float(target.x_p) * batch_stats.rate_p_eff, rate_d_cap)
+        x_rate = min(
+            x_capacity, float(target.c) / max(1e-9, ttft_service_s + t_dec_s + think)
+        )
+        b_dec = max(
+            1.0, min(float(min(target.c, int(max_decode_seqs))), x_rate * t_dec_s)
+        )
+
+    x_rate = min(
+        x_capacity, float(target.c) / max(1e-9, ttft_service_s + t_dec_s + think)
     )
-    return p90_ttft_d_ms, p90_tpot_ms, interactivity, out_tput, tot_tput
+    ttft_est_s = float(target.c) / max(1e-9, x_rate) - t_dec_s - think
+    est_ttft_d_ms = ttft_est_s * UNIT_MILLIS_PER_SECOND
+    est_tpot_ms = tpot_s * UNIT_MILLIS_PER_SECOND
+    interactivity = UNIT_MILLIS_PER_SECOND / max(1e-9, est_tpot_ms)
+    out_tput = (x_rate * osl) / float(target.total_chips)
+    tot_tput = (x_rate * float(ctx.scenario.isl + ctx.scenario.osl)) / float(
+        target.total_chips
+    )
+    return (est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput, sf_d)
 
 
 def _solve_disagg_think_batch(
@@ -1109,7 +1490,7 @@ def _solve_disagg_think_batch(
         sf_d_tmp = _eval_decode_floor(ctx, dec.topo, dec.par, b_local)
         w_srv = (
             pref.ttft_ms / UNIT_MILLIS_PER_SECOND
-            + dec_steps_per_req * sf_d_tmp.serial_floor_s
+            + dec_steps_per_req * sf_d_tmp.serial_estimate_s
         )
         c_act = float(target.c) * w_srv / (w_srv + ctx.scenario.think_time_s)
         b_local = max(1, math.ceil(c_act / max(1, target.y_d * dec.par.dp)))
@@ -1120,27 +1501,56 @@ def _resolve_effective_prefill(
     ctx: _SolveContext,
     pref: _PrefillOption,
     h_eff: float,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]],
-) -> tuple[float, float]:
-    """Recompute cached prefill (ttft_ms, rate_p) when prefix hit rate is clamped."""
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
+) -> tuple[float, float, float]:
+    """Recompute cached prefill (ttft_ms, rate_p, bound_ttft_ms) when h is clamped."""
     if h_eff >= ctx.scenario.prefix_hit_rate:
-        return pref.ttft_ms, pref.rate_p
+        return (pref.ttft_ms, pref.rate_p, pref.bound_ttft_ms)
     p_key = (pref.topo.name, pref.par, round(h_eff, 6))
     cached_p = cache.get(p_key)
     if cached_p is not None:
         return cached_p
     eff_isl_p = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
     n_chunks_p = max(1, math.ceil(eff_isl_p / max(1, ctx.scenario.prefill_chunk)))
-    sf_p_eff = _prefill_step_floor(ctx, pref.topo, pref.par, h_eff)
+    sf_p_eff_raw = _prefill_step_floor(ctx, pref.topo, pref.par, h_eff)
+    sf_p_eff = scale_pp_stage_floor(
+        sf_p_eff_raw, pref.pp_part, ctx.chip, pref.par, pref.topo
+    )
     ttft_p_eff = (
-        sf_p_eff.serial_floor_s
+        sf_p_eff.serial_estimate_s
         * (1.0 + float(pref.par.pp - 1) / float(max(1, n_chunks_p)))
         * UNIT_MILLIS_PER_SECOND
     )
-    rate_p_eff = 1.0 / max(1e-9, sf_p_eff.serial_floor_s)
-    cached_p = (ttft_p_eff, rate_p_eff)
+    rate_p_eff = 1.0 / max(1e-9, sf_p_eff.serial_estimate_s)
+    cached_p = (
+        ttft_p_eff,
+        rate_p_eff,
+        sf_p_eff.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+    )
     cache[p_key] = cached_p
     return cached_p
+
+
+def _fit_disagg_decode_batch(
+    ctx: _SolveContext,
+    dec: _DisaggDecodeState,
+    pref: _PrefillOption,
+    target: _DisaggRatioTarget,
+) -> tuple[int, int, HbmBreakdown] | None:
+    """Resolve active local batch and HBM-fitting resident decode batch."""
+    b_local = _solve_disagg_think_batch(ctx, dec, pref, target)
+    b_start = min(b_local, dec.b_hbm_max, dec.b_smem_max)
+    if ctx.scenario.max_num_seqs is not None:
+        b_start = min(b_start, ctx.scenario.max_num_seqs)
+    clamp_key = (dec.par, b_start)
+    if clamp_key in ctx.clamp_batch_cache:
+        clamped = ctx.clamp_batch_cache[clamp_key]
+    else:
+        clamped = _clamp_resident_batch(ctx, dec.par, b_start)
+        ctx.clamp_batch_cache[clamp_key] = clamped
+    if clamped is None:
+        return None
+    return (b_local, clamped[0], clamped[1])
 
 
 def _evaluate_disagg_instance_pair(
@@ -1148,54 +1558,63 @@ def _evaluate_disagg_instance_pair(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     target: _DisaggRatioTarget,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]],
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
 ) -> ParetoPoint | None:
-    """Evaluate one instance ratio pair (x_p, y_d) for disaggregated serving."""
-    if ctx.max_chips is not None and target.total_chips > ctx.max_chips:
-        return None
+    """Evaluate one instance ratio pair (xP, yD) for disaggregated serving."""
     if dec.b_hbm_max < 1 or dec.b_smem_max < 1:
         return None
-    b_local = _solve_disagg_think_batch(ctx, dec, pref, target)
-    b_start = min(b_local, dec.b_hbm_max, dec.b_smem_max)
-    if ctx.scenario.max_num_seqs is not None:
-        b_start = min(b_start, ctx.scenario.max_num_seqs)
-    clamped = _clamp_resident_batch(ctx, dec.par, b_start)
-    if clamped is None:
+    fitted_d = _fit_disagg_decode_batch(ctx, dec, pref, target)
+    if fitted_d is None:
         return None
-    b_res, hbm_bd_d = clamped
+    b_local, b_res, hbm_bd_d = fitted_d
     hbm_d = hbm_bd_d.total
     ctx.hbm_fit += 1
-    cap_tok, h_eff = kv_capacity_and_hit_rate(
-        ctx.geom,
-        ctx.dtypes,
-        dec.par,
-        b_res,
-        KvFitInput(
-            b_ws=b_local,
-            ctx_full=ctx.ctx_full,
-            hbm_limit_b=ctx.hbm_limit_b,
-            w_base_b=dec.w_base_b,
-            b_kv_phys_core=dec.b_kv_phys,
-            offload_b_per_core=dec.offload_b_per_core,
-            prefix_hit_rate=ctx.scenario.prefix_hit_rate,
-            kv_working_set_turns=ctx.scenario.kv_working_set_turns,
-        ),
-    )
+    kv_key = (dec.par, b_res, b_local, dec.offload_b_per_core)
+    cached_kv = ctx.kv_fit_cache.get(kv_key)
+    if cached_kv is None:
+        cached_kv = kv_capacity_and_hit_rate(
+            ctx.geom,
+            ctx.dtypes,
+            dec.par,
+            b_res,
+            KvFitInput(
+                b_ws=b_local,
+                ctx_full=ctx.ctx_full,
+                hbm_limit_b=ctx.hbm_limit_b,
+                w_base_b=dec.w_base_b,
+                b_kv_phys_core=dec.b_kv_phys,
+                offload_b_per_core=dec.offload_b_per_core,
+                prefix_hit_rate=ctx.scenario.prefix_hit_rate,
+                kv_working_set_turns=ctx.scenario.kv_working_set_turns,
+            ),
+        )
+        ctx.kv_fit_cache[kv_key] = cached_kv
+    cap_tok, h_eff = cached_kv
     cap_tok_int = None if math.isinf(cap_tok) else int(cap_tok)
-    ttft_eff_ms, rate_p_eff = _resolve_effective_prefill(ctx, pref, h_eff, cache)
-    sf_d = _eval_decode_floor(ctx, dec.topo, dec.par, b_res)
-    p90_ttft_d_ms, p90_tpot_ms, interactivity, out_tput, tot_tput = (
+    ttft_eff_ms, rate_p_eff, bound_ttft_ms = _resolve_effective_prefill(
+        ctx, pref, h_eff, cache
+    )
+    est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput, sf_d = (
         _compute_disagg_metrics(
             ctx,
             dec,
+            pref,
             target,
-            _DisaggBatchStats(b_res, b_local, ttft_eff_ms, rate_p_eff),
-            sf_d,
+            _DisaggBatchStats(
+                b_res=b_res,
+                b_local=b_local,
+                ttft_eff_ms=ttft_eff_ms,
+                rate_p_eff=rate_p_eff,
+                h_eff=h_eff,
+                bound_ttft_p_ms=bound_ttft_ms,
+            ),
         )
     )
-    slo_ok = (
-        ctx.scenario.ttft_slo_ms is None or p90_ttft_d_ms <= ctx.scenario.ttft_slo_ms
-    ) and (ctx.scenario.tpot_slo_ms is None or p90_tpot_ms <= ctx.scenario.tpot_slo_ms)
+    bound_tpot_ms = (sf_d.hard_floor_s * UNIT_MILLIS_PER_SECOND) / ctx.eff_al
+    verdict, slo_ok = _resolve_slo_verdict(
+        ctx.scenario, est_ttft_d_ms, est_tpot_ms, bound_ttft_ms, bound_tpot_ms
+    )
+
     max_seqs_d = b_res if b_res < b_local else ctx.scenario.max_num_seqs
     p_pool = _build_pool_mesh_plan(
         _PoolPlanInput(
@@ -1210,6 +1629,8 @@ def _evaluate_disagg_instance_pair(
             hbm_weights_gb=pref.hbm_bd.weights / UNIT_GIGA,
             hbm_kv_gb=pref.hbm_bd.kv / UNIT_GIGA,
             hbm_state_gb=pref.hbm_bd.state / UNIT_GIGA,
+            pp_layer_partition=pref.pp_part,
+            kv_offload_gb=0.0,
         )
     )
     d_pool = _build_pool_mesh_plan(
@@ -1225,6 +1646,8 @@ def _evaluate_disagg_instance_pair(
             hbm_weights_gb=hbm_bd_d.weights / UNIT_GIGA,
             hbm_kv_gb=hbm_bd_d.kv / UNIT_GIGA,
             hbm_state_gb=hbm_bd_d.state / UNIT_GIGA,
+            pp_layer_partition=None,
+            kv_offload_gb=ctx.scenario.kv_offload_gb,
         )
     )
     return ParetoPoint(
@@ -1233,14 +1656,17 @@ def _evaluate_disagg_instance_pair(
         total_chips=target.total_chips,
         prefill_pool=p_pool,
         decode_pool=d_pool,
-        p90_ttft_ms=p90_ttft_d_ms,
-        p90_tpot_ms=p90_tpot_ms,
-        p90_interactivity_tok_s=interactivity,
+        est_ttft_ms=est_ttft_d_ms,
+        est_tpot_ms=est_tpot_ms,
+        est_interactivity_tok_s=interactivity,
         output_throughput_per_chip=out_tput,
         token_throughput_per_chip=tot_tput,
         p_mixed=0.0,
         binding=sf_d.binding,
         slo_met=slo_ok,
+        bound_tpot_ms=bound_tpot_ms,
+        bound_ttft_ms=bound_ttft_ms,
+        slo_verdict=verdict,
         decode_floor=_floor_times(sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
@@ -1252,13 +1678,13 @@ def _search_disagg_instance_ratios(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     c: int,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]],
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
 ) -> list[ParetoPoint]:
     """Search instance multiplier ratios (x_p, y_d) for one prefill-decode pair."""
     dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
-    b_one = math.ceil(c / max(1, dec.par.dp))
+    b_one = max(1, min(math.ceil(c / max(1, dec.par.dp)), dec.b_hbm_max))
     sf_d_one = _eval_decode_floor(ctx, dec.topo, dec.par, b_one)
-    rate_d_one = float(c) / (dec_steps_per_req * max(1e-9, sf_d_one.serial_floor_s))
+    rate_d_one = float(c) / (dec_steps_per_req * max(1e-9, sf_d_one.serial_estimate_s))
     eff_max_inst = (
         ctx.max_instances if ctx.max_instances is not None else DEFAULT_MAX_INSTANCES
     )
@@ -1298,14 +1724,14 @@ def _evaluate_disaggregated_candidates(
     if ctx.mode not in ("auto", "disagg") or not prefill_options:
         return []
     candidates: list[ParetoPoint] = []
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]] = {}
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]] = {}
     for topo_d in topos:
-        offload_b = (
-            float(ctx.scenario.kv_offload_gb)
-            * UNIT_GIGA
-            / float(max(1, topo_d.num_cores))
-        )
         for par_d in _candidate_decode_parallels(ctx.geom, topo_d):
+            offload_b = (
+                float(ctx.scenario.kv_offload_gb)
+                * UNIT_GIBI
+                / float(max(1, par_d.tp * par_d.pp))
+            )
             w_base_d, b_hbm_max_d, b_smem_max_d, b_kv_phys_d, _ = (
                 _decode_capacity_profile(ctx, par_d)
             )
@@ -1358,12 +1784,15 @@ def solve_serving_plan(
     opts = options or SolveOptions()
     if not (0.0 < opts.gpu_memory_utilization <= 1.0):
         msg = (
-            f"gpu_memory_utilization must be in (0, 1], got "
-            f"{opts.gpu_memory_utilization}"
+            "gpu_memory_utilization must be in (0, 1], "
+            f"got {opts.gpu_memory_utilization}"
         )
         raise ValueError(msg)
-    topos = _resolve_solve_topologies(opts)
-    hbm_limit_b = float(opts.gpu_memory_utilization) * float(chip.hbm_bytes)
+    hbm_limit_b = max(
+        0.0,
+        float(opts.gpu_memory_utilization) * float(chip.hbm_bytes)
+        - opts.hbm_reserve_gb * UNIT_GIGA,
+    )
     eff_al = max(1.0, scenario.accept_len)
     spec_k = (
         scenario.spec_tokens
@@ -1398,8 +1827,10 @@ def solve_serving_plan(
         n_chunks=n_chunks,
         page_size=page_size,
         c_max=max(scenario.concurrencies),
+        hbm_reserve_gb=opts.hbm_reserve_gb,
     )
 
+    topos = _resolve_solve_topologies(opts)
     prefill_options, min_prefill_ttft_ms = _find_prefill_options(ctx, topos)
     mixed_candidates, min_c1_tpot_ms, min_mixed_ttft_ms = _evaluate_mixed_candidates(
         ctx,
@@ -1431,14 +1862,20 @@ def solve_serving_plan(
 
     slo_candidates = [p for p in candidates if p.slo_met]
     pool_for_frontier = slo_candidates if slo_candidates else candidates
-    if candidates and not slo_candidates and not warnings:
+    if not candidates and not warnings:
+        warnings.append("No feasible layout met memory and latency constraints.")
+    elif candidates and not slo_candidates and not warnings:
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
 
     frontier = _pareto_filter(pool_for_frontier)
+    rec_pool = [p for p in frontier if p.slo_verdict == "estimate_meets"]
+    if not rec_pool:
+        rec_pool = list(frontier)
     recommended = (
-        max(frontier, key=lambda p: p.token_throughput_per_chip) if frontier else None
+        max(rec_pool, key=lambda p: p.token_throughput_per_chip) if rec_pool else None
     )
-    return ServingPlan(
+    pruned_sweep = prune_sweep_candidates(geom, dtypes, chip, scenario, candidates)
+    base_plan = ServingPlan(
         model_layers=geom.num_layers,
         chip=chip.name,
         scenario=scenario,
@@ -1454,4 +1891,14 @@ def solve_serving_plan(
             slo_met=len(slo_candidates),
             frontier=len(frontier),
         ),
+        sweep_candidates=pruned_sweep,
+        spec_tokens=spec_k,
+        mtp_layers=geom.mtp_layers,
+        hbm_reserve_gb=opts.hbm_reserve_gb,
+    )
+    win_range, cross_rate = sweep_prefix_hit_crossovers(geom, dtypes, chip, base_plan)
+    return replace(
+        base_plan,
+        winner_prefix_hit_range=win_range,
+        prefix_hit_crossover_rate=cross_rate,
     )

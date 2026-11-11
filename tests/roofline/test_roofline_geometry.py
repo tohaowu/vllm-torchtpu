@@ -26,12 +26,6 @@ from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, ChipOverrides, chips
 from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.partition import count_full_attn_layers
 
-
-def _get_pallas_tpu() -> object:
-    """Import and return jax.experimental.pallas.tpu or skip test."""
-    return pytest.importorskip("jax.experimental.pallas.tpu")
-
-
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
         "hidden_size": 4096,
@@ -66,7 +60,7 @@ def test_topologies_exclude_subhost_shapes() -> None:
 
 def test_chip_table_matches_jax_tpu_info() -> None:
     """Verify CHIPS['tpu7x'] parameters exactly match JAX's TPU info table."""
-    pltpu = _get_pallas_tpu()
+    pltpu = pytest.importorskip("jax.experimental.pallas.tpu")
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     c = CHIPS["tpu7x"]
     assert c.hbm_bytes == info.hbm_capacity_bytes
