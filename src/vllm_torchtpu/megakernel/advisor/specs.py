@@ -423,6 +423,10 @@ class WorkloadSpec:
     hbm_utilization_cap: float = 0.80
     dispatch_regime: DispatchRegime = "auto"
     efficiency: EfficiencySpec = EfficiencySpec()
+    # Most rows the megakernel serves in one decode or verify call. A larger
+    # batch runs as separate calls that each stream their weights again.
+    # 0: no declared limit.
+    max_rows_per_call: int = 0
 
     def __post_init__(self) -> None:
         """Enforce non-negative finite scalar lengths and overhead inputs."""

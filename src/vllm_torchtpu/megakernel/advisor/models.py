@@ -968,13 +968,14 @@ def model_profile_from_hf_config(
     name: str = "model",
     weight_dtype: str | None = None,
     expert_dtype: str | None = None,
-    kv_dtype: str = "fp8",
+    *,
+    state_dtype: str = "bf16",
 ) -> ModelProfile:
     """Parse and validate a HuggingFace config mapping into a ModelProfile."""
     return _resolve_hf_profile(
         raw_cfg,
         name,
-        (weight_dtype, expert_dtype, kv_dtype, "bf16"),
+        (weight_dtype, expert_dtype, "fp8", state_dtype),
     )
 
 

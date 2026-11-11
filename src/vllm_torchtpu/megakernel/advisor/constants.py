@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -314,3 +315,59 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
 )
 
 KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_k2", "kimi_k3", "kimi_linear"})
+
+
+@dataclass(frozen=True)
+class CoreLimits:
+    """Verified limits mirrored from `megakernel/core/exec_spec.py` and `profile.py`."""
+
+    max_batch_rows: int = 128
+    verified_ranks: tuple[int, ...] = (1, 2, 4, 8, 16)
+    chip_kinds: tuple[str, ...] = ("TPU7x",)
+    max_ar_slots_per_layer: int = 2
+    nbd: int = 14
+    nbe: int = 10
+    bank: int = 2 << 20
+    ebank: int = 1 << 20
+    vmem_mib: int = 62
+    default_decode_bucket_top: int = 32
+    default_verify_bucket_top: int = 64
+
+
+CORE_LIMITS = CoreLimits()
+CHIP_KIND_MAP: Mapping[str, str] = {"tpu7x": "TPU7x"}
+
+MIN_VMEM_MIB = 2
+DEFAULT_USABLE_VMEM_MIB = CORE_LIMITS.vmem_mib
+DOUBLE_BUFFER_SLOTS = 2
+GROUPED_MOE_MODES: frozenset[str] = frozenset({"grouped_on_chip"})
+VALID_DMA_BUFFERS = (2, 3)
+WIDE_DENSE_RING_SLOTS = CORE_LIMITS.nbd
+WIDE_EXPERT_RING_SLOTS = CORE_LIMITS.nbe
+DENSE_SLOT_DEFAULT_BYTES = CORE_LIMITS.bank
+EXPERT_SLOT_DEFAULT_BYTES = CORE_LIMITS.ebank
+ARENA_ALIGN_RESERVE_BYTES = 2 << 20
+ATTN_TILE_TOKENS = 128
+GDN_STREAMED_HEADS_CAP = 8
+DENSE_FFN_TILE_CAP = 1024
+FP32_BYTES = 4
+CHIPS_PER_HOST = 8
+
+DEFAULT_LAUNCH_GAP_FLOOR_US = 1.0
+DEFAULT_LAUNCH_GAP_VAL_US = 2.0
+DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
+COMPILED_XLA_GAP_P50_US = 1.0
+COMPILED_XLA_GAP_P90_US = 1.5
+UNFUSED_EAGER_GAP_US = 6.0
+PER_OP_COLLECTIVE_CALL_FACTOR = 2
+BOUNDARY_SYNC_HOP_FACTOR = 2.0
+
+DOT_FP8 = "fp8"
+DOT_BF16 = "bf16"
+AB_KNOB = "ab_step_time"
+SETTLE_CMD = "Pass --measurements measurements.json (schema advisor.measurements.v1)"
+CORNER_AXES: Mapping[str, int] = {
+    "launch_gap_us": 0,
+    "collective_latency_us": 1,
+    "prefill_attn_dot_dtype": 2,
+}
