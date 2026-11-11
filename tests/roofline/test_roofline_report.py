@@ -31,6 +31,7 @@ from vllm_torchtpu.roofline import (
     render_html,
     solve_serving_plan,
 )
+from vllm_torchtpu.roofline.emit import pool_label
 from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.report import MAX_EMBEDDED_CANDIDATES
 
@@ -297,3 +298,36 @@ def test_executive_card_renders_bound_and_estimate_band(
     custom_html = render_html(custom_payload)
     assert "custom_tpu_v6 Per-TensorCore Specs:" in custom_html
     assert "32.0 GB" in custom_html
+
+
+_BASE_POOL: dict[str, object] = {
+    "instances": 1,
+    "topology": "2x2x1",
+    "tp": 1,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "pcp": 1,
+    "kv_split": 1,
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"tp": 2, "dp": 4, "ep": 8}, "2x2x1 [TP2 DP4 EP8]"),
+        ({"pp": 8}, "2x2x1 [PP8]"),
+        ({"pp": 2, "pcp": 4, "ep": 4}, "2x2x1 [PP2 PCP4 EP4]"),
+        (
+            {"instances": 4, "topology": "2x2x2", "tp": 16, "kv_split": 2, "ep": 16},
+            "4\u00d7 2x2x2 [TP16 DCP2 EP16]",
+        ),
+        ({"topology": "1x1x1"}, "1x1x1 [TP1]"),
+    ],
+)
+def test_pool_label_omits_single_count_and_lists_axes(
+    overrides: dict[str, object],
+    expected: str,
+) -> None:
+    """A single-instance pool shows no count; only axes above 1 are listed."""
+    assert pool_label({**_BASE_POOL, **overrides}) == expected

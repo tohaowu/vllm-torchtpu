@@ -44,7 +44,12 @@ from .constants import (
     UNIT_MICROS_PER_SECOND,
     WEIGHT_DTYPE_BYTES,
 )
-from .emit import build_solve_payload, emit_ceiling_rows, emit_launch_args
+from .emit import (
+    build_solve_payload,
+    emit_ceiling_rows,
+    emit_launch_args,
+    pool_label,
+)
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
@@ -1032,24 +1037,28 @@ def _render_solve_output(
         payload = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
         sys.stdout.write(json.dumps(payload) + "\n")
         return 0
-    sys.stdout.write(
-        f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
-        f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'bound_tpot_ms':>13}  "
-        f"{'est_ttft_ms':>11}  {'est_tpot_ms':>11}\n"
-    )
-    for pt in splan.frontier:
-        pools = (
-            f"{pt.prefill_pool.instances}x{pt.prefill_pool.topology}P+"
-            f"{pt.decode_pool.instances}x{pt.decode_pool.topology}D"
+    pool_labels = [
+        (
+            f"P {pool_label(asdict(pt.prefill_pool))} + "
+            f"D {pool_label(asdict(pt.decode_pool))}"
             if pt.prefill_pool is not None
-            else f"1x{pt.decode_pool.topology}(TP{pt.decode_pool.tp})"
+            else pool_label(asdict(pt.decode_pool))
         )
+        for pt in splan.frontier
+    ]
+    pw = max(len("pools"), *(len(p) for p in pool_labels))
+    sys.stdout.write(
+        f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<{pw}}  "
+        f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'bound_tpot_ms':>13}  "
+        f"{'est_ttft_ms':>11}  {'est_tpot_ms':>11}\n",
+    )
+    for pt, pools in zip(splan.frontier, pool_labels, strict=True):
         sys.stdout.write(
             f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
-            f"{pools:<24}  {pt.est_interactivity_tok_s:>13.2f}  "
+            f"{pools:<{pw}}  {pt.est_interactivity_tok_s:>13.2f}  "
             f"{pt.token_throughput_per_chip:>13.1f}  "
             f"{pt.bound_tpot_ms:>13.2f}  "
-            f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n"
+            f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n",
         )
     sys.stdout.write(
         "# Note: bound_* columns are hard physical lower bounds; "

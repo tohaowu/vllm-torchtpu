@@ -32,6 +32,7 @@ from .constants import (
     UNIT_PETA,
     UNIT_TERA,
 )
+from .emit import pool_label
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -538,9 +539,7 @@ def _extract_recommended_view(
         if d_pool:
             pools_list.append(d_pool)
         pools_summary = " + ".join(
-            f"{_as_int(p.get('instances'), 1)}x {p.get('topology', '')} "
-            f"({p.get('role', '')})"
-            for p in pools_list
+            f"{p.get('role', '')} {pool_label(p)}" for p in pools_list
         )
         floor = _as_mapping(rec.get("decode_floor"))
         ttft_val = _as_float(rec.get("est_ttft_ms"))
@@ -647,14 +646,11 @@ def _render_table_rows(top_k: Sequence[Mapping[str, object]]) -> str:
         p_pool = _as_mapping(pt.get("prefill_pool"))
         d_pool = _as_mapping(pt.get("decode_pool"))
         if p_pool:
-            p_pools.append(
-                f"{_as_int(p_pool.get('instances'), 1)}x{p_pool.get('topology', '')}"
-            )
+            p_pools.append(f"P {pool_label(p_pool)}")
         if d_pool:
-            p_pools.append(
-                f"{_as_int(d_pool.get('instances'), 1)}x{d_pool.get('topology', '')}"
-            )
-        p_str = "+".join(p_pools)
+            prefix = "D " if p_pool else ""
+            p_pools.append(f"{prefix}{pool_label(d_pool)}")
+        p_str = " + ".join(p_pools)
 
         rows.append(
             f"<tr>"

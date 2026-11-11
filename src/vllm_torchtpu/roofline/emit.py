@@ -33,6 +33,15 @@ if TYPE_CHECKING:
     from .modules import Dtypes
     from .solver import ParetoPoint, PoolMeshPlan, ServingPlan
 
+_POOL_AXES: tuple[tuple[str, str], ...] = (
+    ("TP", "tp"),
+    ("DP", "dp"),
+    ("PP", "pp"),
+    ("PCP", "pcp"),
+    ("DCP", "kv_split"),
+    ("EP", "ep"),
+)
+
 MOE_DISPATCH_NOTES: Final[tuple[str, ...]] = (
     "- 'allreduce': src/vllm_torchtpu/layers/adapter/custom_ops/moe_runner.py:128 "
     "(default when USE_MOE_FUSED_EP_KERNEL=0)",
@@ -179,6 +188,25 @@ def pool_cli_args(
     return args
 
 
+def _pool_int(val: object, default: int = 1) -> int:
+    """Return integer pool attribute value when present, else default."""
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    return default
+
+
+def pool_label(pool: Mapping[str, object]) -> str:
+    """Return a concise pool label such as ``4x 2x2x2 [TP16 DCP2 EP16]``."""
+    axes = " ".join(
+        f"{name}{_pool_int(pool.get(key))}"
+        for name, key in _POOL_AXES
+        if _pool_int(pool.get(key)) > 1
+    )
+    count = _pool_int(pool.get("instances"))
+    prefix = f"{count}\u00d7 " if count > 1 else ""
+    return f"{prefix}{pool.get('topology', '')} [{axes or 'TP1'}]"
+
+
 def _format_server_cmd(
     cli_args: list[str],
     model: str | None,
@@ -306,15 +334,9 @@ def point_launch_args(
         p_chips = p_pool.instances * p_pool.chips_per_instance
         d_chips = d_pool.instances * d_pool.chips_per_instance
         commands = [
-            (
-                f"# provision: prefill {p_pool.instances}x {p_pool.topology} "
-                f"({p_chips} chips)"
-            ),
+            f"# provision: prefill {pool_label(asdict(p_pool))} ({p_chips} chips)",
             prefill_cmd,
-            (
-                f"# provision: decode {d_pool.instances}x {d_pool.topology} "
-                f"({d_chips} chips)"
-            ),
+            f"# provision: decode {pool_label(asdict(d_pool))} ({d_chips} chips)",
             decode_cmd,
             (
                 "# note: disaggregated KV transfer / connector flags are not "
