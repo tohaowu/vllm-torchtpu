@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from ..core import spec
+    from ..core.exec_spec import ExecSpec
     from .chips import ChipSpec
 
 from ..core.errors import MegakernelConfigError
@@ -122,7 +123,7 @@ def verify_core_limits_sync() -> list[str]:
 
 
 def _try_plan_spec(
-    model_spec: spec.ModelSpec, ex: exec_spec.ExecSpec
+    model_spec: spec.ModelSpec, ex: ExecSpec
 ) -> tuple[str, bool, Mapping[str, int], int, str, str, str]:
     """Isolate planner.plan and return parsed weights, ring slots, and dtypes."""
     if planner is None or jnp is None:
@@ -154,7 +155,7 @@ def _try_plan_spec(
 
 def advise_from_spec(
     model_spec: spec.ModelSpec,
-    ex: exec_spec.ExecSpec,
+    ex: ExecSpec,
     chip: ChipSpec | str = "tpu7x",
     moe_mode: MoEMode = "masked_on_chip",
     dp: int = 1,

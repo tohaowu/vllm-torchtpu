@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from . import (
     assets,
+    calibrate,
     chips,
     cli,
     models,
@@ -29,6 +30,7 @@ from . import (
     verdict,
     vmem,
 )
+from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
     BUILTIN_CHIP_SPECS,
     REQUIRED_CHIP_SPEC_KEYS,
@@ -137,6 +139,7 @@ __all__ = [
     "AdvisorSweepReport",
     "BucketSchedulePayload",
     "BucketScheduleRule",
+    "CalibrateOptions",
     "ChipSpec",
     "CoreLimits",
     "DeploymentPreset",
@@ -166,6 +169,8 @@ __all__ = [
     "advise_regimes",
     "assets",
     "build_arg_parser",
+    "calibrate",
+    "calibrate_trace",
     "chips",
     "cli",
     "compare_parallelism_candidates",

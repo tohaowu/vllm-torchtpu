@@ -412,3 +412,37 @@ SCOPE_HINTS: Mapping[str, str] = {
     "single_layer": "one call per layer",
     "per_op": "one call per operator; activations hand off through HBM",
 }
+
+DEFAULT_PHASE = "decode"
+PS_PER_US = 1_000_000.0
+NS_PER_US = 1_000.0
+# Gaps above 500 us reflect idle pauses rather than kernel launch overhead.
+MAX_INTRA_STEP_GAP_US = 500.0
+MIN_COLLECTIVE_GROUP_SIZE = 2
+MIN_STEPS_FOR_WARMUP_DROP = 3
+MIN_WARMUP_DROP_STEPS = 2
+DEFAULT_CALIBRATE_LAYERS = 60
+SUBLAYER_BOUNDARIES_PER_LAYER = 2
+MIN_STEP_OPS_FOR_EXPLICIT_NORM = 2
+CONSERVED_GAP_DECIMALS = 10
+QUANTILE_DECIMALS = 4
+WARMUP_OUTLIER_RATIO = 2.0
+MIN_EVENTS_FOR_WARMUP_DROP = 4
+CONSERVED_GAP_UNIT = "us_per_sublayer_boundary"
+STEP_COVERAGE_BASIS = "trace"
+FUSED_ELIGIBLE_PHASES: tuple[str, ...] = ("decode", "verify")
+XPLANE_DEVICE_PLANE_PREFIX = "/device:"
+XPLANE_SPARSE_FILTER = "sparse"
+COLLECTIVE_IGNORE_SUFFIXES: tuple[str, ...] = ("-done", ".done")
+XLA_MODULE_MARKERS: tuple[str, ...] = ("xla module", "xla_module")
+STEP_EVENT_MARKERS: tuple[str, ...] = ("step", "model_step", "step_num")
+COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("all-reduce", "all-reduce"),
+    ("allreduce", "all-reduce"),
+    ("all-gather", "all-gather"),
+    ("allgather", "all-gather"),
+    ("reduce-scatter", "reduce-scatter"),
+    ("reducescatter", "reduce-scatter"),
+    ("all-to-all", "all-to-all"),
+    ("alltoall", "all-to-all"),
+)

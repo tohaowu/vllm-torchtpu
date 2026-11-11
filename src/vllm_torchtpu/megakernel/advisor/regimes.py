@@ -75,7 +75,7 @@ class RegimeSweepOptions:
     pp: int = 1
     dcp: int = 1
     pcp: int = 1
-    measurements: object = None
+    measurements: MeasurementsData | Mapping[str, object] | Path | str | None = None
     deployment_preset: bool = True
     chip_spec_path: str | Path | None = None
 
@@ -597,7 +597,7 @@ def _evaluate_sweep_workloads(
     prof: ModelProfile,
     chip_spec: ChipSpec,
     workloads: tuple[tuple[str, WorkloadSpec], ...],
-    meas_opt: object,
+    meas_opt: MeasurementsData | Mapping[str, object] | Path | str | None,
 ) -> tuple[list[RegimeEntry], list[AdvisorReport]]:
     """Evaluate workloads across all regimes and assemble report entries."""
     entries: list[RegimeEntry] = []
@@ -683,7 +683,7 @@ def advise_regimes(
     chip: ChipSpec | str = DEFAULT_CHIP,
     *,
     options: RegimeSweepOptions | None = None,
-    measurements: object = None,
+    measurements: MeasurementsData | Mapping[str, object] | Path | str | None = None,
 ) -> AdvisorSweepReport:
     """Evaluate the 12-regime Batch Size x Phase & Context matrix."""
     cfg = options or RegimeSweepOptions()
