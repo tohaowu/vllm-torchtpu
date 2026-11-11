@@ -15,45 +15,29 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
+import re
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
-from vllm_torchtpu.megakernel.advisor import chips, models, specs
+from vllm_torchtpu.megakernel.advisor import (
+    chips,
+    constants,
+    jax_bridge,
+    models,
+    specs,
+)
 from vllm_torchtpu.megakernel.core import errors
 
-_TPU7X_CORES_PER_DEVICE = 2
-_SINGLE_CORE = 1
-_BYTES_PER_MIB = 1 << 20
-_BYTES_PER_GIB = 1 << 30
-_TPU7X_USABLE_MIB = 62
-_TPU7X_PHYSICAL_MIB = 64
-_CUSTOM_VMEM_USABLE_MIB = 58
-_CUSTOM_VMEM_CAP_MIB = 64
-_MIN_PRESET_COUNT = 10
-_DEEPSEEK_LAYERS = 61
-_DEEPSEEK_MOE_LAYERS = 58
-_DEEPSEEK_EXPERTS = 256
-_DEEPSEEK_TOP_K = 8
-_DEEPSEEK_Q_LORA_RANK = 1536
-_DEEPSEEK_KV_LORA_RANK = 512
-_QWEN35_LAYERS = 60
-_QWEN35_ATTN_LAYERS = 15
-_QWEN35_LINEAR_LAYERS = 45
-_QWEN35_EXPERTS = 512
-_QWEN35_TOP_K = 10
-_LLAMA_LAYERS = 32
-_KIMI_LAYERS = 93
-_KIMI_LINEAR_LAYERS = 69
-_KIMI_ROUTED_HIDDEN = 3584
-_GLM5_LAYERS = 78
-_GLM5_MOE_LAYERS = 75
-_GLM5_EXPERTS = 256
-_TEST_MODEL_LAYERS = 16
+MIB = 1 << 20
+GIB = 1 << 30
+SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
 
-_DEEPSEEK_V3_CFG: dict[str, object] = {
+DEEPSEEK_V3_CFG: dict[str, object] = {
     "model_type": "deepseek_v3",
     "num_hidden_layers": 61,
     "first_k_dense_replace": 3,
@@ -73,7 +57,7 @@ _DEEPSEEK_V3_CFG: dict[str, object] = {
     "quantization_config": {"quant_method": "fp8"},
 }
 
-_QWEN35_397B_CFG: dict[str, object] = {
+QWEN35_397B_CFG: dict[str, object] = {
     "model_type": "qwen3_5_moe",
     "num_hidden_layers": 60,
     "hidden_size": 4096,
@@ -94,7 +78,7 @@ _QWEN35_397B_CFG: dict[str, object] = {
     "quantization_config": {"quant_method": "fp8"},
 }
 
-_KIMI_K3_PRO_CFG: dict[str, object] = {
+KIMI_K3_PRO_CFG: dict[str, object] = {
     "model_type": "kimi_linear",
     "num_hidden_layers": 93,
     "first_k_dense_replace": 1,
@@ -127,19 +111,33 @@ def test_tpu7x_dual_core_defaults() -> None:
     """Verify TPU v7x resolves to dual-core defaults."""
     chip_spec = chips.resolve_chip_spec("tpu7x")
     assert chip_spec.name == "tpu7x"
-    assert chip_spec.devices_per_chip == _TPU7X_CORES_PER_DEVICE
-    assert chip_spec.cores_per_device == _SINGLE_CORE
-    assert chip_spec.vmem_usable_bytes == _TPU7X_USABLE_MIB * _BYTES_PER_MIB
-    assert chip_spec.vmem_capacity_bytes == _TPU7X_PHYSICAL_MIB * _BYTES_PER_MIB
+    expected_devices, expected_cores = 2, 1
+    assert chip_spec.devices_per_chip == expected_devices
+    assert chip_spec.cores_per_device == expected_cores
+    assert chip_spec.vmem_usable_bytes == 62 * MIB
+    assert chip_spec.vmem_capacity_bytes == 64 * MIB
 
 
 def test_single_core_escape_hatch() -> None:
     """Verify single-core escape hatch preserves 1-core spec on TPU v7x."""
     chip_spec = chips.resolve_chip_spec("tpu7x", megacore=False)
     assert chip_spec.name == "tpu7x"
-    assert chip_spec.cores_per_device == _SINGLE_CORE
-    assert chip_spec.vmem_usable_bytes == _TPU7X_USABLE_MIB * _BYTES_PER_MIB
-    assert chip_spec.vmem_capacity_bytes == _TPU7X_PHYSICAL_MIB * _BYTES_PER_MIB
+    assert chip_spec.cores_per_device == 1
+    assert chip_spec.vmem_usable_bytes == 62 * MIB
+    assert chip_spec.vmem_capacity_bytes == 64 * MIB
+
+
+def test_auto_chip_detect_tpu7x_two_cores_per_chip_no_error() -> None:
+    """Verify --chip auto resolves tpu7x cleanly even when JAX sees 2 cores/chip."""
+    with (
+        mock.patch.object(chips, "detect_tpu_from_sysfs", return_value=None),
+        mock.patch.object(jax_bridge, "probe_jax_tpu_info", return_value=("7x", 2)),
+    ):
+        chip_spec = chips.resolve_chip_spec("auto")
+    assert chip_spec.name == "tpu7x"
+    assert chip_spec.cores_per_device == 1
+    expected_devices = 2
+    assert chip_spec.devices_per_chip == expected_devices
 
 
 def test_all_preset_chips_load() -> None:
@@ -157,10 +155,10 @@ def test_chip_spec_json_override(tmp_path: Path) -> None:
     custom_json = tmp_path / "custom_chip.json"
     payload = {
         "name": "custom_v7",
-        "cores_per_device": _SINGLE_CORE,
-        "vmem_capacity_bytes": _CUSTOM_VMEM_CAP_MIB * _BYTES_PER_MIB,
-        "vmem_usable_bytes": _CUSTOM_VMEM_USABLE_MIB * _BYTES_PER_MIB,
-        "hbm_capacity_bytes": 128 * _BYTES_PER_GIB,
+        "cores_per_device": 1,
+        "vmem_capacity_bytes": 64 * MIB,
+        "vmem_usable_bytes": 58 * MIB,
+        "hbm_capacity_bytes": 128 * GIB,
         "hbm_bw_bytes_per_s": 2400e9,
         "bf16_flops_per_s": 1150e12,
         "fp8_flops_per_s": 2300e12,
@@ -172,8 +170,8 @@ def test_chip_spec_json_override(tmp_path: Path) -> None:
     custom_json.write_text(json.dumps(payload), encoding="utf-8")
     loaded = chips.resolve_chip_spec("custom", chip_spec_path=custom_json)
     assert loaded.name == "custom_v7"
-    assert loaded.vmem_usable_bytes == _CUSTOM_VMEM_USABLE_MIB * _BYTES_PER_MIB
-    assert loaded.cores_per_device == _SINGLE_CORE
+    assert loaded.vmem_usable_bytes == payload["vmem_usable_bytes"]
+    assert loaded.cores_per_device == 1
 
 
 def test_resolve_chip_spec_unknown_raises() -> None:
@@ -194,23 +192,25 @@ def test_all_preset_models_resolve() -> None:
 
 def test_hf_config_autodiscovery_deepseek_v3() -> None:
     """Verify DeepSeek-V3 HF config auto-discovery sets MLA parameters."""
-    profile = models.model_profile_from_hf_config(_DEEPSEEK_V3_CFG)
-    assert profile.num_layers == _DEEPSEEK_LAYERS
-    assert profile.num_moe_layers == _DEEPSEEK_MOE_LAYERS
-    assert profile.num_experts == _DEEPSEEK_EXPERTS
-    assert profile.top_k == _DEEPSEEK_TOP_K
-    assert profile.q_lora_rank == _DEEPSEEK_Q_LORA_RANK
-    assert profile.kv_lora_rank == _DEEPSEEK_KV_LORA_RANK
+    profile = models.model_profile_from_hf_config(DEEPSEEK_V3_CFG)
+    assert profile.num_layers == DEEPSEEK_V3_CFG["num_hidden_layers"]
+    exp_moe, exp_experts, exp_top_k, exp_q_lora, exp_kv_lora = 58, 256, 8, 1536, 512
+    assert profile.num_moe_layers == exp_moe
+    assert profile.num_experts == exp_experts
+    assert profile.top_k == exp_top_k
+    assert profile.q_lora_rank == exp_q_lora
+    assert profile.kv_lora_rank == exp_kv_lora
 
 
 def test_hf_config_autodiscovery_qwen3_next_hybrid() -> None:
     """Verify Qwen3.5 hybrid linear-attention config autodiscovery."""
-    profile = models.model_profile_from_hf_config(_QWEN35_397B_CFG)
-    assert profile.num_layers == _QWEN35_LAYERS
-    assert profile.num_attention_layers == _QWEN35_ATTN_LAYERS
-    assert profile.num_linear_layers == _QWEN35_LINEAR_LAYERS
-    assert profile.num_experts == _QWEN35_EXPERTS
-    assert profile.top_k == _QWEN35_TOP_K
+    profile = models.model_profile_from_hf_config(QWEN35_397B_CFG)
+    assert profile.num_layers == QWEN35_397B_CFG["num_hidden_layers"]
+    exp_attn, exp_lin, exp_experts, exp_top_k = 15, 45, 512, 10
+    assert profile.num_attention_layers == exp_attn
+    assert profile.num_linear_layers == exp_lin
+    assert profile.num_experts == exp_experts
+    assert profile.top_k == exp_top_k
 
 
 def test_hf_config_autodiscovery_dense_llama() -> None:
@@ -225,19 +225,21 @@ def test_hf_config_autodiscovery_dense_llama() -> None:
         "head_dim": 128,
     }
     profile = models.model_profile_from_hf_config(cfg)
-    assert profile.num_layers == _LLAMA_LAYERS
-    assert profile.num_attention_layers == _LLAMA_LAYERS
+    assert profile.num_layers == cfg["num_hidden_layers"]
+    assert profile.num_attention_layers == cfg["num_hidden_layers"]
     assert profile.num_linear_layers == 0
     assert profile.num_experts == 0
 
 
 def test_hf_config_autodiscovery_kimi_k25_native_int4() -> None:
     """Verify Kimi-K3 nested linear_attn_config and mxfp4 expert quantization."""
-    profile = models.model_profile_from_hf_config(_KIMI_K3_PRO_CFG)
-    assert profile.num_layers == _KIMI_LAYERS
-    assert profile.num_linear_layers == _KIMI_LINEAR_LAYERS
-    assert profile.routed_expert_hidden_size == _KIMI_ROUTED_HIDDEN
+    profile = models.model_profile_from_hf_config(KIMI_K3_PRO_CFG)
+    assert profile.num_layers == KIMI_K3_PRO_CFG["num_hidden_layers"]
+    exp_lin, exp_routed_h = 69, 3584
+    assert profile.num_linear_layers == exp_lin
+    assert profile.routed_expert_hidden_size == exp_routed_h
     assert profile.expert_dtype == "mxfp4"
+    assert profile.unmodeled_features == ("fp4_expert_dequant",)
 
 
 def test_hf_config_autodiscovery_glm5_mla_dsa() -> None:
@@ -260,9 +262,10 @@ def test_hf_config_autodiscovery_glm5_mla_dsa() -> None:
         "num_experts_per_tok": 8,
     }
     profile = models.model_profile_from_hf_config(cfg)
-    assert profile.num_layers == _GLM5_LAYERS
-    assert profile.num_moe_layers == _GLM5_MOE_LAYERS
-    assert profile.num_experts == _GLM5_EXPERTS
+    assert profile.num_layers == cfg["num_hidden_layers"]
+    exp_moe, exp_experts = 75, 256
+    assert profile.num_moe_layers == exp_moe
+    assert profile.num_experts == exp_experts
 
 
 def test_preset_models_json_schema() -> None:
@@ -274,7 +277,10 @@ def test_preset_models_json_schema() -> None:
     assert deployments_json.is_file()
     models_data = json.loads(models_json.read_text(encoding="utf-8"))
     assert "presets" in models_data
-    assert len(models_data["presets"]) >= _MIN_PRESET_COUNT
+    min_presets = 10
+    assert len(models_data["presets"]) >= min_presets
+    for moe_slug in ("mixtral-8x22b", "llama-4-maverick", "gpt-oss-120b"):
+        assert models_data["presets"][moe_slug]["moe_intermediate_size"] > 0
     deployments_data = json.loads(deployments_json.read_text(encoding="utf-8"))
     assert "deployments" in deployments_data
 
@@ -288,25 +294,21 @@ def test_detect_sysfs_and_hf_snapshot_accept_injected_paths(tmp_path: Path) -> N
     detected = chips.detect_tpu_from_sysfs(tmp_path / "pci")
     assert detected == "tpu7x"
     chip_spec = chips.resolve_chip_spec(detected)
-    assert chip_spec.name == "tpu7x"
-    assert chip_spec.devices_per_chip == _TPU7X_CORES_PER_DEVICE
+    expected_devices = 2
+    assert (chip_spec.name, chip_spec.devices_per_chip) == ("tpu7x", expected_devices)
 
     hf_home = tmp_path / "hf_home"
     repo_dir = hf_home / "hub" / "models--testorg--testmodel"
     snap_dir = repo_dir / "snapshots" / "abc123rev"
     snap_dir.mkdir(parents=True)
     cfg_file = snap_dir / "config.json"
-    cfg_file.write_text(
-        json.dumps(
-            {
-                "model_type": "llama",
-                "num_hidden_layers": 16,
-                "hidden_size": 2048,
-                "num_attention_heads": 16,
-            }
-        ),
-        encoding="utf-8",
-    )
+    cfg_payload = {
+        "model_type": "llama",
+        "num_hidden_layers": 16,
+        "hidden_size": 2048,
+        "num_attention_heads": 16,
+    }
+    cfg_file.write_text(json.dumps(cfg_payload), encoding="utf-8")
     ref_main = repo_dir / "refs" / "main"
     ref_main.parent.mkdir(parents=True, exist_ok=True)
     ref_main.write_text("abc123rev\n", encoding="utf-8")
@@ -314,21 +316,14 @@ def test_detect_sysfs_and_hf_snapshot_accept_injected_paths(tmp_path: Path) -> N
     resolved = models.resolve_hf_snapshot_config("testorg/testmodel", hf_home=hf_home)
     assert resolved == cfg_file
     profile = models.resolve_model_profile(resolved)
-    assert profile.num_layers == _TEST_MODEL_LAYERS
-
-
-_TPU7X_INT8_BF16_FLOPS = 1.155e15
-_DEEPSEEK_V4_COMPRESS_RATIO = 0.325
-_RESIDUAL_STREAMS_4 = 4
-_DENSE_PREFIX_MOE_LAYERS_3 = 3
-_SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
+    assert profile.num_layers == cfg_payload["num_hidden_layers"]
 
 
 def test_tpu7x_int8_peak_equals_bf16_rate() -> None:
     """Verify tpu7x int8 peak FLOP/s equals the BF16 rate (1155 TFLOP/s)."""
     c7x = chips.resolve_chip_spec("tpu7x")
     assert c7x.int8_flops_per_s == c7x.bf16_flops_per_s
-    assert c7x.peak_flops("int8") == _TPU7X_INT8_BF16_FLOPS
+    assert c7x.peak_flops("int8") == c7x.bf16_flops_per_s
 
 
 def test_chip_sources_cover_every_field() -> None:
@@ -342,11 +337,17 @@ def test_chip_sources_cover_every_field() -> None:
         )
         for key in value_fields:
             src_val = spec.sources[key]
-            assert src_val.startswith(_SOURCE_PREFIXES), (
+            assert src_val.startswith(SOURCE_PREFIXES), (
                 f"{name}.{key} source missing class prefix: {src_val!r}"
             )
-    for legacy in ("v5p", "v5e", "v4"):
-        assert chips.BUILTIN_CHIP_SPECS[legacy].topologies == {}
+    expected_legacy = {
+        "v5p": (constants.V5P_TOPOLOGIES, 8),
+        "v5e": (constants.V5E_TOPOLOGIES, 1),
+        "v4": (constants.V4_TOPOLOGIES, 8),
+    }
+    for legacy_chip, expected in expected_legacy.items():
+        spec = chips.BUILTIN_CHIP_SPECS[legacy_chip]
+        assert (spec.topologies, spec.min_slice_cores) == expected
 
 
 def test_jax_bridge_checks_every_exposed_field() -> None:
@@ -365,13 +366,12 @@ def test_jax_bridge_checks_every_exposed_field() -> None:
 def test_dense_prefix_predicate_matches_non_homogeneous_reasons() -> None:
     """Verify dense_prefix_moe is derived when 0 < moe_layers < num_layers."""
     cfg = {
-        **_DEEPSEEK_V3_CFG,
-        "num_hidden_layers": _RESIDUAL_STREAMS_4,
+        **DEEPSEEK_V3_CFG,
+        "num_hidden_layers": 4,
         "first_k_dense_replace": 1,
     }
     prof = models.model_profile_from_hf_config(cfg)
-    assert prof.num_layers == _RESIDUAL_STREAMS_4
-    assert prof.num_moe_layers == _DENSE_PREFIX_MOE_LAYERS_3
+    assert (prof.num_layers, prof.num_moe_layers) == (4, 3)
     assert "dense_prefix_moe" in prof.layer_families
 
 
@@ -403,18 +403,18 @@ def test_hf_config_autodiscovery_deepseek_v4_csa_and_mhc() -> None:
         "num_experts_per_tok": 8,
         "layer_types": ["mla", "csa", "csa", "csa"],
         "compress_ratios": [1.0, 0.1, 0.1, 0.1],
-        "mhc_num_streams": _RESIDUAL_STREAMS_4,
+        "mhc_num_streams": 4,
     }
     prof = models.model_profile_from_hf_config(cfg)
     assert prof.architecture_unverified is False
-    assert prof.kv_compress_factor == pytest.approx(_DEEPSEEK_V4_COMPRESS_RATIO)
-    assert prof.residual_streams == _RESIDUAL_STREAMS_4
+    assert prof.kv_compress_factor == pytest.approx(0.325)
+    assert prof.residual_streams == cfg["mhc_num_streams"]
     assert "sparse_csa" in prof.layer_families
     assert "hyper_connection" in prof.layer_families
 
 
 def test_hf_config_autodiscovery_qwen4_exp_hyper_connections() -> None:
-    """Verify qwen4_exp HCA layer token and hc_count residual streams."""
+    """Verify qwen4_exp HCA, indexed_attention, and hc_mult residual streams."""
     cfg: dict[str, object] = {
         "model_type": "qwen4_exp",
         "num_hidden_layers": 4,
@@ -425,10 +425,104 @@ def test_hf_config_autodiscovery_qwen4_exp_hyper_connections() -> None:
         "head_dim": 128,
         "linear_num_key_heads": 16,
         "linear_num_value_heads": 16,
-        "layer_types": ["hca", "gdn", "gdn", "gdn"],
-        "hc_count": _RESIDUAL_STREAMS_4,
+        "layer_types": ["hca", "indexed_attention", "gdn", "gdn"],
+        "hc_mult": 4,
     }
     prof = models.model_profile_from_hf_config(cfg)
     assert prof.architecture_unverified is False
-    assert prof.residual_streams == _RESIDUAL_STREAMS_4
+    assert prof.residual_streams == cfg["hc_mult"]
     assert "hyper_connection" in prof.layer_families
+
+
+def test_hf_config_compress_ratios_divisors_and_geometry_validation() -> None:
+    """Verify divisor compress_ratios invert and invalid ratios/heads fail closed."""
+    cfg_div = {
+        **DEEPSEEK_V3_CFG,
+        "num_hidden_layers": 4,
+        "first_k_dense_replace": 0,
+        "compress_ratios": [1.0, 10.0, 10.0, 10.0],
+        "quantization_config": {"quant_method": "gptq", "bits": 8},
+    }
+    prof = models.model_profile_from_hf_config(cfg_div)
+    assert prof.kv_compress_factor == pytest.approx(0.325)
+    assert prof.weight_dtype == "int8"
+
+    with pytest.raises(models.UnsupportedArchitectureError, match="compress_ratios"):
+        models.model_profile_from_hf_config(
+            {**cfg_div, "compress_ratios": [1.0, -2.0, 0.5, 0.5]}
+        )
+
+    with pytest.raises(models.UnsupportedArchitectureError, match="num_kv_heads"):
+        models.model_profile_from_hf_config(
+            {**DEEPSEEK_V3_CFG, "num_key_value_heads": 256}
+        )
+
+    with pytest.raises(models.UnsupportedArchitectureError, match="head_dim"):
+        models.model_profile_from_hf_config(
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 4,
+                "hidden_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 6,
+            }
+        )
+
+
+def test_fail_closed_spec_loaders_and_specs_bounds(tmp_path: Path) -> None:
+    """Verify chip overrides, measurements, RingPlan, and EfficiencySpec fail closed."""
+    bad_chip = tmp_path / "bad_chip.json"
+    bad_chip.write_text(
+        json.dumps(
+            {
+                "vmem_capacity_bytes": 64 * MIB,
+                "hbm_capacity_bytes": 100 * GIB,
+                "hbm_bw_bytes_per_s": 3.0e12,
+                "bf16_flops_per_s": 1.0e15,
+                "collective_latency_us_bracket": [1.0, 2.0, 3.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(errors.MegakernelConfigError, match="2-element"):
+        chips.load_chip_spec_file(bad_chip)
+
+    with pytest.raises(errors.MegakernelConfigError, match="numeric"):
+        specs.load_measurements(
+            {
+                "schema": constants.MEASUREMENTS_SCHEMA,
+                "launch_gap_us": {"p50": "not-a-float"},
+            }
+        )
+
+    with pytest.raises(errors.MegakernelConfigError, match=r"RingPlan\.dense_slots"):
+        specs.RingPlan(dense_slots=0)
+
+    with pytest.raises(errors.MegakernelConfigError, match=r"EfficiencySpec\.eta_hbm"):
+        specs.EfficiencySpec(eta_hbm=1.5)
+
+
+def _extract_assign_names(node: ast.stmt) -> list[str]:
+    """Return assigned top-level variable names from an AST statement."""
+    if isinstance(node, ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, ast.Name)]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return [node.target.id]
+    return []
+
+
+def test_no_private_underscore_module_constants() -> None:
+    """Verify advisor Python modules define zero _UPPER_CASE module constants."""
+    advisor_dir = Path(models.__file__).resolve().parent
+    pattern = re.compile(r"_[A-Z][A-Z0-9_]*")
+    offenders = [
+        f"{py_path.name}:{name}"
+        for py_path in sorted(advisor_dir.glob("*.py"))
+        for node in ast.parse(
+            py_path.read_text(encoding="utf-8"), filename=str(py_path)
+        ).body
+        for name in _extract_assign_names(node)
+        if pattern.fullmatch(name)
+    ]
+    assert offenders == [], f"Found private module constants: {offenders}"

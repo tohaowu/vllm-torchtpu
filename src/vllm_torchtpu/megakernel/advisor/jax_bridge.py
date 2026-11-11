@@ -15,19 +15,64 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-try:
-    from jax.experimental.pallas import tpu as pltpu
-except (ImportError, RuntimeError):
-    pltpu = None
+import importlib
+from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
     from .chips import ChipSpec
 
 
+class _ChipVersionEnum(Protocol):
+    """Typed protocol for JAX Pallas ChipVersion enum member."""
+
+    value: object
+
+
+class _ChipVersionType(Protocol):
+    """Typed protocol for JAX Pallas ChipVersion enum class."""
+
+    __members__: dict[str, object]
+
+
+class _TpuInfo(Protocol):
+    """Typed protocol for JAX Pallas TPU hardware descriptor."""
+
+    chip_version: _ChipVersionEnum
+    num_cores: int
+    vmem_capacity_bytes: int
+    hbm_capacity_bytes: int
+    mem_bw_bytes_per_second: float
+    bf16_ops_per_second: float
+    fp8_ops_per_second: float | None
+    int8_ops_per_second: float | None
+
+
+class _PallasTpuModule(Protocol):
+    """Typed protocol for `jax.experimental.pallas.tpu` module API."""
+
+    ChipVersion: _ChipVersionType
+
+    def get_tpu_info(self) -> _TpuInfo:
+        """Return hardware info for attached TPU devices."""
+
+    def get_tpu_info_for_chip(
+        self, chip_version: object, cores_per_device: int
+    ) -> _TpuInfo:
+        """Return hardware info for a named TPU chip generation."""
+
+
+def _load_pltpu() -> _PallasTpuModule | None:
+    """Lazily import jax.experimental.pallas.tpu without loading JAX at import."""
+    try:
+        mod = importlib.import_module("jax.experimental.pallas.tpu")
+    except (ImportError, RuntimeError):
+        return None
+    return cast("_PallasTpuModule", mod)
+
+
 def probe_jax_tpu_info() -> tuple[str, int] | None:
     """Probe TPU device version and core count from JAX Pallas if available."""
+    pltpu = _load_pltpu()
     if pltpu is None:
         return None
     try:
@@ -37,20 +82,32 @@ def probe_jax_tpu_info() -> tuple[str, int] | None:
         return None
 
 
+CHIP_TO_PALLAS_VERSION: dict[str, str] = {
+    "tpu7x": "TPU_7X",
+    "v6e": "TPU_V6E",
+    "v5p": "TPU_V5P",
+    "v5e": "TPU_V5E",
+    "v4": "TPU_V4",
+}
+
+
 def verify_chip_spec_against_jax(spec: ChipSpec) -> list[str]:
     """Compare a built-in ChipSpec against jax.experimental.pallas.tpu if available."""
+    pltpu = _load_pltpu()
     if pltpu is None:
         return []
     base_name = spec.name.removesuffix("_megacore")
-    cv_str = "7x" if base_name == "tpu7x" else base_name
-    try:
-        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion(cv_str), 1)
-    except (ValueError, KeyError, RuntimeError, AttributeError):
+    enum_key = CHIP_TO_PALLAS_VERSION.get(base_name)
+    if enum_key is None:
         return []
+    chip_ver = pltpu.ChipVersion.__members__.get(enum_key)
+    if chip_ver is None:
+        return []
+    info = pltpu.get_tpu_info_for_chip(chip_ver, 1)
     cores = spec.cores_per_device
     mismatches: list[str] = []
-    fp8_raw = float(getattr(info, "fp8_ops_per_second", 0) or 0) * cores
-    int8_raw = float(getattr(info, "int8_ops_per_second", 0) or 0) * cores
+    fp8_raw = float(info.fp8_ops_per_second or 0) * cores
+    int8_raw = float(info.int8_ops_per_second or 0) * cores
     exp_fp8 = fp8_raw if fp8_raw > 0 else float(spec.bf16_flops_per_s)
     exp_int8 = int8_raw if int8_raw > 0 else float(spec.bf16_flops_per_s)
     checks = (

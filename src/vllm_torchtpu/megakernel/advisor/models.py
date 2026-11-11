@@ -16,17 +16,25 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from math import gcd
 from pathlib import Path
 
 from ..core import errors
-
-_MIN_INTERVAL = 2
-_BITS_FP8 = 8
-_BITS_FP4 = 4
-_PRESETS_DIR = Path(__file__).resolve().parent / "data" / "presets"
+from .constants import (
+    BITS_FP4,
+    BITS_FP8,
+    KDA_MODEL_TYPES,
+    MIN_HEAD_DIM,
+    MIN_INTERVAL,
+    MULTIMODAL_KEYS,
+    PRESETS_DIR,
+    UNSUPPORTED_NON_CAUSAL_TYPES,
+    UNSUPPORTED_SSM_MODEL_TYPES,
+    VALID_LAYER_TOKENS,
+)
 
 
 class UnsupportedArchitectureError(errors.MegakernelConfigError, ValueError):
@@ -66,64 +74,6 @@ RECOGNIZED_MODEL_TYPES: frozenset[str] = frozenset(
 )
 
 SUPPORTED_MODEL_TYPES: frozenset[str] = RECOGNIZED_MODEL_TYPES
-
-_UNSUPPORTED_NON_CAUSAL_TYPES: frozenset[str] = frozenset(
-    {"bert", "roberta", "t5", "whisper", "vit", "clip", "dit", "flux", "sdxl"}
-)
-
-_UNSUPPORTED_SSM_MODEL_TYPES: frozenset[str] = frozenset(
-    {
-        "mamba",
-        "mamba2",
-        "rwkv",
-        "rwkv6",
-        "falcon_mamba",
-        "xlstm",
-        "retnet",
-        "hyena",
-        "stripedhyena",
-    }
-)
-
-_MULTIMODAL_KEYS: tuple[str, ...] = (
-    "vision_config",
-    "audio_config",
-    "video_config",
-    "mm_projector_type",
-    "image_token_index",
-)
-
-_VALID_LAYER_TOKENS: frozenset[str] = frozenset(
-    {
-        "attention",
-        "csa",
-        "dense_mlp",
-        "hca",
-        "dsa",
-        "dsa_attention",
-        "full_attention",
-        "gated_deltanet",
-        "gdn",
-        "gqa",
-        "kda",
-        "kda_attention",
-        "kimi_linear",
-        "linear_attention",
-        "mamba",
-        "mla",
-        "mla_attention",
-        "mlp",
-        "moe",
-        "mtp",
-        "ple",
-        "sliding_attention",
-        "sliding_window_attention",
-        "sparse_mla",
-        "swa",
-    }
-)
-
-_KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_k2", "kimi_k3", "kimi_linear"})
 
 
 @dataclass(frozen=True)
@@ -169,39 +119,6 @@ class ModelProfile:
     residual_streams: int = 1
     unmodeled_features: tuple[str, ...] = ()
 
-    def __post_init__(self) -> None:
-        """Derive attention/MoE layer counts, periodicity, and layer families."""
-        num_layers = self.num_layers
-        has_experts = self.num_experts > 0
-        moe_layers = self.num_moe_layers
-        attn_layers = self.num_attention_layers or (num_layers - self.num_linear_layers)
-        moe_layers = num_layers * has_experts if moe_layers < 0 else moe_layers
-        periodic = self.is_periodic and not (0 < moe_layers < num_layers)
-        moe_inter = self.moe_intermediate_size or (self.intermediate_size * has_experts)
-        exp_dt = self.expert_dtype or self.weight_dtype
-        mtype = self.model_type.strip().lower()
-        unverified = self.architecture_unverified or bool(
-            mtype and mtype not in RECOGNIZED_MODEL_TYPES
-        )
-        families = self.layer_families or _derive_layer_families(
-            self, attn_layers=attn_layers, moe_layers=moe_layers
-        )
-        reasons = self.non_homogeneous_reasons or _non_homogeneous_reasons(
-            num_layers, moe_layers
-        )
-        updates = (
-            ("num_attention_layers", attn_layers),
-            ("num_moe_layers", moe_layers),
-            ("is_periodic", periodic),
-            ("moe_intermediate_size", moe_inter),
-            ("expert_dtype", exp_dt),
-            ("architecture_unverified", unverified),
-            ("layer_families", families),
-            ("non_homogeneous_reasons", reasons),
-        )
-        for key, val in updates:
-            object.__setattr__(self, key, val)
-
 
 def _non_homogeneous_reasons(num_layers: int, moe_layers: int) -> tuple[str, ...]:
     """Return non-homogeneity tags for mixed dense-prefix and MoE stacks."""
@@ -213,13 +130,13 @@ def _non_homogeneous_reasons(num_layers: int, moe_layers: int) -> tuple[str, ...
 def _derive_layer_families(
     profile: ModelProfile, *, attn_layers: int, moe_layers: int
 ) -> tuple[str, ...]:
-    """Derive canonical layer families from a ModelProfile's layer counts."""
+    """Derive canonical layer families from resolved model layer counts."""
     families: list[str] = []
     if attn_layers > 0:
         families.append("mla" if profile.kv_lora_rank > 0 else "gqa")
     if profile.num_linear_layers > 0:
         mtype = profile.model_type.strip().lower()
-        families.append("kda" if mtype in _KDA_MODEL_TYPES else "gdn")
+        families.append("kda" if mtype in KDA_MODEL_TYPES else "gdn")
     if moe_layers > 0:
         families.append("moe")
     if moe_layers < profile.num_layers and profile.intermediate_size > 0:
@@ -233,16 +150,96 @@ def _derive_layer_families(
     return tuple(families)
 
 
-def _int_field(mapping: Mapping[str, object], *keys: str, default: int = 0) -> int:
+def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
+    """Return an immutable ModelProfile with derived layer metadata populated."""
+    num_layers = profile.num_layers
+    has_experts = profile.num_experts > 0
+    attn_layers = profile.num_attention_layers or (
+        num_layers - profile.num_linear_layers
+    )
+    resolved_moe_layers = (
+        num_layers * has_experts
+        if profile.num_moe_layers < 0
+        else profile.num_moe_layers
+    )
+    periodic = profile.is_periodic and not (0 < resolved_moe_layers < num_layers)
+    moe_inter = profile.moe_intermediate_size or (
+        profile.intermediate_size * has_experts
+    )
+    exp_dt = profile.expert_dtype or profile.weight_dtype
+    mtype = profile.model_type.strip().lower()
+    unverified = profile.architecture_unverified or bool(
+        mtype and mtype not in RECOGNIZED_MODEL_TYPES
+    )
+    families = profile.layer_families or _derive_layer_families(
+        profile, attn_layers=attn_layers, moe_layers=resolved_moe_layers
+    )
+    reasons = profile.non_homogeneous_reasons or _non_homogeneous_reasons(
+        num_layers, resolved_moe_layers
+    )
+    return replace(
+        profile,
+        num_attention_layers=attn_layers,
+        num_moe_layers=resolved_moe_layers,
+        is_periodic=periodic,
+        moe_intermediate_size=moe_inter,
+        expert_dtype=exp_dt,
+        architecture_unverified=unverified,
+        layer_families=families,
+        non_homogeneous_reasons=reasons,
+    )
+
+
+def _as_mapping(val: object) -> Mapping[str, object] | None:
+    """Return val when it is a Mapping, else None."""
+    match val:
+        case Mapping() as mapping:
+            return mapping
+        case _:
+            return None
+
+
+def _as_sequence(val: object) -> tuple[object, ...] | None:
+    """Return val as a tuple when it is a list or tuple, else None."""
+    match val:
+        case list() | tuple():
+            return tuple(val)
+        case _:
+            return None
+
+
+def _as_scalar_number(val: object) -> float | None:
+    """Return finite float for numeric scalars while rejecting bools and strings."""
+    match val:
+        case bool():
+            return None
+        case int() | float():
+            num = float(val)
+            return num if math.isfinite(num) else None
+        case _:
+            return None
+
+
+def _int_field(
+    mapping: Mapping[str, object], keys: tuple[str, ...], *, default: int = 0
+) -> int:
     """Return the first non-zero integer value matching keys in mapping."""
     for key in keys:
         val = mapping.get(key)
-        if (
-            isinstance(val, (int, float, str))
-            and not isinstance(val, Mapping)
-            and int(val) != 0
-        ):
-            return int(val)
+        match val:
+            case bool():
+                continue
+            case int() | float():
+                if int(val) != 0:
+                    return int(val)
+            case str():
+                stripped = val.strip()
+                if stripped:
+                    parsed = int(stripped)
+                    if parsed != 0:
+                        return parsed
+            case _:
+                continue
     return default
 
 
@@ -295,11 +292,11 @@ class _NormalizedHfConfig:
         if require_model_type and not self.model_type:
             msg = "HuggingFace config missing required 'model_type' field"
             raise UnsupportedArchitectureError(msg)
-        if self.model_type in _UNSUPPORTED_NON_CAUSAL_TYPES:
+        if self.model_type in UNSUPPORTED_NON_CAUSAL_TYPES:
             msg = f"Unsupported non-causal-LM model_type {self.model_type!r}"
             raise UnsupportedArchitectureError(msg)
         if (
-            self.model_type in _UNSUPPORTED_SSM_MODEL_TYPES
+            self.model_type in UNSUPPORTED_SSM_MODEL_TYPES
             and not self.has_gdn_kda_heads
         ):
             msg = (
@@ -322,6 +319,18 @@ class _NormalizedHfConfig:
                     f"{key_name!r} >= 1"
                 )
                 raise UnsupportedArchitectureError(msg)
+        if self.num_kv_heads < 0 or self.num_kv_heads > self.num_heads:
+            msg = (
+                f"Invalid num_kv_heads ({self.num_kv_heads}) for "
+                f"num_attention_heads ({self.num_heads})"
+            )
+            raise UnsupportedArchitectureError(msg)
+        if self.head_dim < MIN_HEAD_DIM or self.head_dim % MIN_HEAD_DIM != 0:
+            msg = (
+                f"Invalid head_dim ({self.head_dim}): must be >= {MIN_HEAD_DIM} "
+                f"and divisible by {MIN_HEAD_DIM}"
+            )
+            raise UnsupportedArchitectureError(msg)
         self._validate_layer_tokens()
 
     def _validate_layer_tokens(self) -> None:
@@ -330,10 +339,10 @@ class _NormalizedHfConfig:
             return
         for token in self.raw_layer_types:
             tok_s = str(token)
-            if tok_s not in _VALID_LAYER_TOKENS:
+            if tok_s not in VALID_LAYER_TOKENS:
                 msg = (
                     f"Unknown layer_type {tok_s!r}; supported tokens: "
-                    f"{sorted(_VALID_LAYER_TOKENS)}"
+                    f"{sorted(VALID_LAYER_TOKENS)}"
                 )
                 raise UnsupportedArchitectureError(msg)
             if tok_s == "mamba" and not self.has_gdn_kda_heads:
@@ -353,7 +362,7 @@ class _NormalizedHfConfig:
         )
         if has_fp8_tag:
             fallback_dt = "fp8"
-        elif self.quant_bits == _BITS_FP8:
+        elif self.quant_bits == BITS_FP8:
             fallback_dt = "int8" if is_int_quant else "fp8"
         elif is_int_quant and "int8" in self.quant_tag:
             fallback_dt = "int8"
@@ -364,7 +373,7 @@ class _NormalizedHfConfig:
             if "nvfp4" in self.quant_tag
             else (
                 "mxfp4"
-                if "mxfp4" in self.quant_tag or self.quant_bits == _BITS_FP4
+                if "mxfp4" in self.quant_tag or self.quant_bits == BITS_FP4
                 else fallback_dt
             )
         )
@@ -392,43 +401,45 @@ class _NormalizedHfConfig:
 
         resolved_wd, resolved_ed = self.infer_quant_dtypes(weight_dtype, expert_dtype)
 
-        return ModelProfile(
-            name=name,
-            num_layers=self.num_layers,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.ffn_inter,
-            num_attention_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            num_linear_layers=self.num_linear_layers,
-            linear_key_heads=self.lin_k_heads,
-            linear_value_heads=self.lin_v_heads,
-            num_experts=self.num_experts,
-            top_k=self.top_k,
-            moe_intermediate_size=self.moe_inter,
-            shared_expert_intermediate_size=self.shared_inter,
-            num_moe_layers=max(0, self.num_layers - self.dense_prefix)
-            * (self.num_experts > 0),
-            num_attention_layers=0,
-            kv_lora_rank=self.kv_lora_rank,
-            q_lora_rank=self.q_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            linear_key_dim=self.linear_key_dim,
-            linear_value_dim=self.linear_value_dim,
-            linear_conv_kernel=self.linear_conv_kernel,
-            routed_expert_hidden_size=self.routed_expert_hidden_size,
-            is_periodic=self.is_periodic,
-            ar_slots_per_layer=2,
-            weight_dtype=resolved_wd,
-            expert_dtype=resolved_ed,
-            kv_dtype=kv_dtype.lower(),
-            state_dtype=state_dtype.lower(),
-            model_type=self.model_type,
-            has_attn_output_gate=self.has_attn_output_gate,
-            kv_compress_factor=self.kv_compress_factor,
-            residual_streams=self.residual_streams,
-            unmodeled_features=self.unmodeled_features,
+        return finalize_model_profile(
+            ModelProfile(
+                name=name,
+                num_layers=self.num_layers,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.ffn_inter,
+                num_attention_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                num_linear_layers=self.num_linear_layers,
+                linear_key_heads=self.lin_k_heads,
+                linear_value_heads=self.lin_v_heads,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                moe_intermediate_size=self.moe_inter,
+                shared_expert_intermediate_size=self.shared_inter,
+                num_moe_layers=max(0, self.num_layers - self.dense_prefix)
+                * (self.num_experts > 0),
+                num_attention_layers=0,
+                kv_lora_rank=self.kv_lora_rank,
+                q_lora_rank=self.q_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                linear_key_dim=self.linear_key_dim,
+                linear_value_dim=self.linear_value_dim,
+                linear_conv_kernel=self.linear_conv_kernel,
+                routed_expert_hidden_size=self.routed_expert_hidden_size,
+                is_periodic=self.is_periodic,
+                ar_slots_per_layer=2,
+                weight_dtype=resolved_wd,
+                expert_dtype=resolved_ed,
+                kv_dtype=kv_dtype.lower(),
+                state_dtype=state_dtype.lower(),
+                model_type=self.model_type,
+                has_attn_output_gate=self.has_attn_output_gate,
+                kv_compress_factor=self.kv_compress_factor,
+                residual_streams=self.residual_streams,
+                unmodeled_features=self.unmodeled_features,
+            )
         )
 
 
@@ -436,21 +447,22 @@ def _extract_text_subconfig(
     raw_cfg: Mapping[str, object],
 ) -> tuple[Mapping[str, object], bool]:
     """Extract text sub-configuration and multimodal flag from raw HF config."""
-    if not isinstance(raw_cfg, Mapping) or len(raw_cfg) == 0:
+    raw_map = _as_mapping(raw_cfg)
+    if raw_map is None or len(raw_map) == 0:
         msg = "Empty HuggingFace config mapping"
         raise UnsupportedArchitectureError(msg)
     for sub_key in ("text_config", "language_config"):
-        if sub_key in raw_cfg:
-            sub = raw_cfg.get(sub_key)
-            if sub is None or not isinstance(sub, Mapping):
-                msg = f"Multimodal config has non-mapping {sub_key!r}"
-                raise UnsupportedArchitectureError(msg)
-    sub_cfg = raw_cfg.get("text_config") or raw_cfg.get("language_config")
-    tc: Mapping[str, object] = sub_cfg if isinstance(sub_cfg, Mapping) else raw_cfg
+        if sub_key in raw_map and _as_mapping(raw_map.get(sub_key)) is None:
+            msg = f"Multimodal config has non-mapping {sub_key!r}"
+            raise UnsupportedArchitectureError(msg)
+    sub_cfg = _as_mapping(raw_map.get("text_config")) or _as_mapping(
+        raw_map.get("language_config")
+    )
+    tc: Mapping[str, object] = sub_cfg if sub_cfg is not None else raw_map
     is_multimodal = (
-        "text_config" in raw_cfg
-        or "language_config" in raw_cfg
-        or any(k in raw_cfg for k in _MULTIMODAL_KEYS)
+        "text_config" in raw_map
+        or "language_config" in raw_map
+        or any(k in raw_map for k in MULTIMODAL_KEYS)
     )
     if is_multimodal and not tc.get("hidden_size"):
         msg = "Multimodal config missing extractable text_config.hidden_size"
@@ -465,7 +477,7 @@ def _resolve_linear_schedule(
     raw_layer_types: tuple[object, ...] | None,
 ) -> tuple[int, bool]:
     """Resolve (num_linear_layers, is_periodic) from HF layer schedule fields."""
-    interval = _int_field(tc, "full_attention_interval")
+    interval = _int_field(tc, ("full_attention_interval",))
     if raw_layer_types:
         if len(raw_layer_types) != num_layers:
             msg = (
@@ -486,24 +498,20 @@ def _resolve_linear_schedule(
         else:
             is_per = True
         return num_lin, is_per
-    kda_raw = lin_map.get("kda_layers")
+    kda_seq = _as_sequence(lin_map.get("kda_layers"))
     kda_layers = (
-        tuple(v for v in kda_raw if type(v) is int)
-        if isinstance(kda_raw, (list, tuple))
-        else ()
+        tuple(v for v in kda_seq if type(v) is int) if kda_seq is not None else ()
     )
     if kda_layers:
         return len(kda_layers), True
-    fa_raw = lin_map.get("full_attn_layers")
+    fa_seq = _as_sequence(lin_map.get("full_attn_layers"))
     full_attn_layers = (
-        tuple(v for v in fa_raw if type(v) is int)
-        if isinstance(fa_raw, (list, tuple))
-        else ()
+        tuple(v for v in fa_seq if type(v) is int) if fa_seq is not None else ()
     )
     if full_attn_layers:
         return max(0, num_layers - len(full_attn_layers)), True
     num_lin = num_layers - num_layers // interval if interval > 1 else 0
-    is_per = interval < _MIN_INTERVAL or num_layers % interval == 0
+    is_per = interval < MIN_INTERVAL or num_layers % interval == 0
     return num_lin, is_per
 
 
@@ -513,9 +521,7 @@ def _extract_quant_fields(
 ) -> tuple[str, str, int, str, str, str]:
     """Extract (torch_dt, quant_tag, bits, quant_w_type, raw_wd, raw_ed)."""
     quant_raw = tc.get("quantization_config") or raw_cfg.get("quantization_config")
-    quant_map: Mapping[str, object] = (
-        quant_raw if isinstance(quant_raw, Mapping) else {}
-    )
+    quant_map = _as_mapping(quant_raw) or {}
     torch_dt = str(
         tc.get("dtype")
         or raw_cfg.get("dtype")
@@ -523,14 +529,15 @@ def _extract_quant_fields(
         or raw_cfg.get("torch_dtype")
         or "bf16"
     )
-    bits = _int_field(quant_map, "bits", "w_bit")
+    bits = _int_field(quant_map, ("bits", "w_bit"))
     quant_w_type = str(quant_map.get("type") or "").strip().lower()
-    cfg_groups = quant_map.get("config_groups")
-    if isinstance(cfg_groups, Mapping):
+    cfg_groups = _as_mapping(quant_map.get("config_groups"))
+    if cfg_groups is not None:
         for grp in cfg_groups.values():
-            w_grp = grp.get("weights") if isinstance(grp, Mapping) else None
-            if isinstance(w_grp, Mapping):
-                bits = bits or _int_field(w_grp, "num_bits")
+            grp_map = _as_mapping(grp)
+            w_grp = _as_mapping(grp_map.get("weights")) if grp_map is not None else None
+            if w_grp is not None:
+                bits = bits or _int_field(w_grp, ("num_bits",))
                 quant_w_type = (
                     quant_w_type or str(w_grp.get("type") or "").strip().lower()
                 )
@@ -556,8 +563,7 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
     tc, is_multimodal = _extract_text_subconfig(raw_cfg)
     mtype = str(tc.get("model_type") or raw_cfg.get("model_type") or "").strip().lower()
 
-    lin_raw = tc.get("linear_attn_config")
-    lin_map: Mapping[str, object] = lin_raw if isinstance(lin_raw, Mapping) else {}
+    lin_map = _as_mapping(tc.get("linear_attn_config")) or {}
     has_gdn_kda_heads = bool(
         tc.get("linear_num_key_heads")
         or tc.get("linear_num_value_heads")
@@ -567,53 +573,52 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
     )
     has_ssm = "ssm_cfg" in tc or "state_size" in tc
 
-    raw_types = tc.get("layer_types")
-    raw_layer_types: tuple[object, ...] | None = (
-        tuple(raw_types) if isinstance(raw_types, (list, tuple)) else None
-    )
+    raw_layer_types = _as_sequence(tc.get("layer_types"))
 
-    num_layers = _int_field(tc, "num_hidden_layers")
-    hidden_size = _int_field(tc, "hidden_size")
-    num_heads = _int_field(tc, "num_attention_heads")
+    num_layers = _int_field(tc, ("num_hidden_layers",))
+    hidden_size = _int_field(tc, ("hidden_size",))
+    num_heads = _int_field(tc, ("num_attention_heads",))
     num_linear_layers, is_periodic = _resolve_linear_schedule(
         tc, lin_map, num_layers, raw_layer_types
     )
 
     merged: dict[str, object] = {**lin_map, **tc}
     lin_k_heads = _int_field(
-        merged, "linear_num_key_heads", "num_key_heads", "num_k_heads", "num_heads"
+        merged,
+        ("linear_num_key_heads", "num_key_heads", "num_k_heads", "num_heads"),
     )
     lin_v_heads = _int_field(
         merged,
-        "linear_num_value_heads",
-        "num_value_heads",
-        "num_v_heads",
-        "num_heads",
+        ("linear_num_value_heads", "num_value_heads", "num_v_heads", "num_heads"),
     )
 
-    num_experts = _int_field(tc, "num_experts", "n_routed_experts", "num_local_experts")
-    mlp_only = tc.get("mlp_only_layers")
-    dense_prefix = _int_field(tc, "first_k_dense_replace") or (
-        len(mlp_only) if isinstance(mlp_only, (list, tuple)) else 0
+    num_experts = _int_field(
+        tc, ("num_experts", "n_routed_experts", "num_local_experts")
+    )
+    mlp_only = _as_sequence(tc.get("mlp_only_layers"))
+    dense_prefix = _int_field(tc, ("first_k_dense_replace",)) or (
+        len(mlp_only) if mlp_only is not None else 0
     )
 
-    ffn_inter = _int_field(tc, "intermediate_size", "ffn_dim", default=4 * hidden_size)
+    ffn_inter = _int_field(
+        tc, ("intermediate_size", "ffn_dim"), default=4 * hidden_size
+    )
     moe_inter = _int_field(
         tc,
-        "moe_intermediate_size",
-        "latent_moe_dim",
+        ("moe_intermediate_size", "latent_moe_dim"),
         default=ffn_inter * (num_experts > 0),
     )
-    num_shared = _int_field(tc, "n_shared_experts", "num_shared_experts")
+    num_shared = _int_field(tc, ("n_shared_experts", "num_shared_experts"))
     shared_inter = _int_field(
-        tc, "shared_expert_intermediate_size", default=num_shared * moe_inter
+        tc, ("shared_expert_intermediate_size",), default=num_shared * moe_inter
     )
     top_k = _int_field(
-        tc, "num_experts_per_tok", "num_experts_per_token", "num_selected_experts"
+        tc, ("num_experts_per_tok", "num_experts_per_token", "num_selected_experts")
     ) * (num_experts > 0)
     torch_dt, quant_tag, bits, quant_w_type, raw_wd, raw_ed = _extract_quant_fields(
         tc, raw_cfg
     )
+    kv_compress = _extract_kv_compress_factor(tc)
 
     return _NormalizedHfConfig(
         model_type=mtype,
@@ -623,11 +628,10 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_heads=num_heads,
-        num_kv_heads=_int_field(tc, "num_key_value_heads", default=num_heads),
+        num_kv_heads=_int_field(tc, ("num_key_value_heads",), default=num_heads),
         head_dim=_int_field(
             tc,
-            "v_head_dim",
-            "head_dim",
+            ("v_head_dim", "head_dim"),
             default=hidden_size // num_heads if num_heads else 0,
         ),
         num_linear_layers=num_linear_layers,
@@ -641,20 +645,22 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         num_shared=num_shared,
         shared_inter=shared_inter,
         top_k=top_k,
-        kv_lora_rank=_int_field(tc, "kv_lora_rank"),
-        q_lora_rank=_int_field(tc, "q_lora_rank"),
-        qk_nope_head_dim=_int_field(tc, "qk_nope_head_dim"),
-        qk_rope_head_dim=_int_field(tc, "qk_rope_head_dim"),
+        kv_lora_rank=_int_field(tc, ("kv_lora_rank",)),
+        q_lora_rank=_int_field(tc, ("q_lora_rank",)),
+        qk_nope_head_dim=_int_field(tc, ("qk_nope_head_dim",)),
+        qk_rope_head_dim=_int_field(tc, ("qk_rope_head_dim",)),
         linear_key_dim=_int_field(
-            merged, "linear_key_head_dim", "key_head_dim", "head_k_dim", default=128
+            merged, ("linear_key_head_dim", "key_head_dim", "head_k_dim"), default=128
         ),
         linear_value_dim=_int_field(
-            merged, "linear_value_head_dim", "value_head_dim", "head_v_dim", default=128
+            merged,
+            ("linear_value_head_dim", "value_head_dim", "head_v_dim"),
+            default=128,
         ),
         linear_conv_kernel=_int_field(
-            merged, "linear_conv_kernel_dim", "short_conv_kernel_size", default=4
+            merged, ("linear_conv_kernel_dim", "short_conv_kernel_size"), default=4
         ),
-        routed_expert_hidden_size=_int_field(tc, "routed_expert_hidden_size"),
+        routed_expert_hidden_size=_int_field(tc, ("routed_expert_hidden_size",)),
         has_attn_output_gate=bool(tc.get("attn_output_gate", False)),
         torch_dtype=torch_dt,
         quant_tag=quant_tag,
@@ -663,68 +669,83 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         raw_weight_dtype=raw_wd,
         raw_expert_dtype=raw_ed,
         raw_layer_types=raw_layer_types,
-        kv_compress_factor=_extract_kv_compress_factor(tc),
+        kv_compress_factor=kv_compress,
         residual_streams=max(
             1,
             _int_field(
-                tc, "hc_count", "mhc_num_streams", "residual_streams", default=1
+                tc,
+                ("hc_mult", "hc_count", "mhc_num_streams", "residual_streams"),
+                default=1,
             ),
         ),
-        unmodeled_features=_extract_unmodeled_features(raw_cfg, tc, mtype, raw_ed),
+        unmodeled_features=_extract_unmodeled_features(
+            raw_cfg, tc, raw_ed, kv_compress
+        ),
     )
 
 
 def _extract_kv_compress_factor(tc: Mapping[str, object]) -> float:
-    """Extract average KV cache compression ratio from HF config."""
-    compress_ratios = tc.get("compress_ratios")
-    if isinstance(compress_ratios, (list, tuple)) and compress_ratios:
-        vals = [
-            float(str(x))
-            for x in compress_ratios
-            if isinstance(x, (int, float)) and float(str(x)) > 0.0
-        ]
-        if vals:
-            return min(1.0, sum(vals) / len(vals))
-    raw_kcf = tc.get("kv_compress_factor", 1.0)
-    if isinstance(raw_kcf, (int, float)):
-        return min(1.0, max(1e-4, float(raw_kcf)))
+    """Extract average KV cache compression ratio in (0, 1] from HF config."""
+    if "compress_ratios" in tc and tc["compress_ratios"] is not None:
+        raw_ratios = _as_sequence(tc["compress_ratios"])
+        if raw_ratios is None or not raw_ratios:
+            msg = "compress_ratios must be a non-empty sequence of positive numbers"
+            raise UnsupportedArchitectureError(msg)
+        vals: list[float] = []
+        for idx, entry in enumerate(raw_ratios):
+            num = _as_scalar_number(entry)
+            if num is None or num <= 0.0:
+                msg = f"Invalid compress_ratios[{idx}]={entry!r}: expected > 0"
+                raise UnsupportedArchitectureError(msg)
+            vals.append(1.0 / num if num > 1.0 else num)
+        return min(1.0, sum(vals) / len(vals))
+    if "kv_compress_factor" in tc and tc["kv_compress_factor"] is not None:
+        raw_kcf = tc["kv_compress_factor"]
+        num = _as_scalar_number(raw_kcf)
+        if num is None or num <= 0.0 or num > 1.0:
+            msg = f"Invalid kv_compress_factor={raw_kcf!r}: expected value in (0, 1]"
+            raise UnsupportedArchitectureError(msg)
+        return num
     return 1.0
 
 
 def _extract_unmodeled_features(
     raw_cfg: Mapping[str, object],
     tc: Mapping[str, object],
-    mtype: str,
     raw_ed: str,
+    kv_compress_factor: float,
 ) -> tuple[str, ...]:
     """Derive unmodeled architectural features for AdvisorReport disclosure."""
-    raw_list = tc.get("unmodeled_features")
+    raw_seq = _as_sequence(tc.get("unmodeled_features"))
     seed = (
-        [str(x).strip() for x in raw_list if str(x).strip()]
-        if isinstance(raw_list, (list, tuple))
+        [str(x).strip() for x in raw_seq if str(x).strip()]
+        if raw_seq is not None
         else []
     )
     has_mtp = (
-        _int_field(tc, "num_nextn_predict_layers", "mtp_num_layers", "num_mtp_layers")
+        _int_field(tc, ("num_nextn_predict_layers", "mtp_num_layers", "num_mtp_layers"))
         > 0
     )
-    has_vis = mtype == "kimi_linear" or any(
+    has_vis = any(
         k in raw_cfg or k in tc
         for k in ("vision_config", "visual", "mm_projector_type")
     )
-    has_dspark = mtype == "kimi_linear" or any(
-        k in tc for k in ("dspark_config", "drafter_config")
-    )
+    has_dspark = any(k in tc for k in ("dspark_config", "drafter_config"))
     has_hc = (
-        _int_field(tc, "hc_count", "mhc_num_streams", "residual_streams", default=1) > 1
+        _int_field(
+            tc,
+            ("hc_mult", "hc_count", "mhc_num_streams", "residual_streams"),
+            default=1,
+        )
+        > 1
     )
     checks = (
         (has_mtp, "mtp_draft_layers"),
         (has_vis, "vision_tower"),
         (has_dspark, "dspark_drafter"),
         (raw_ed in ("nvfp4", "mxfp4", "fp4"), "fp4_expert_dequant"),
-        (_int_field(tc, "sliding_window") > 0, "sliding_window"),
-        (_extract_kv_compress_factor(tc) < 1.0, "sparse_csa"),
+        (_int_field(tc, ("sliding_window",)) > 0, "sliding_window"),
+        (kv_compress_factor < 1.0, "sparse_csa"),
         (has_hc, "hyper_connection"),
     )
     extra = [tag for cond, tag in checks if cond]
@@ -743,45 +764,49 @@ def _load_model_presets() -> tuple[
     Mapping[str, ModelProfile], Mapping[str, str], Mapping[str, str]
 ]:
     """Load builtin model presets, aliases, and source provenance from JSON."""
-    payload = json.loads((_PRESETS_DIR / "models.json").read_text("utf-8"))
+    payload = json.loads((PRESETS_DIR / "models.json").read_text("utf-8"))
     raw_presets = payload["presets"]
     presets: dict[str, ModelProfile] = {}
     sources: dict[str, str] = {}
     for slug, entry in raw_presets.items():
         sources[slug] = str(entry.get("source", f"models.json:{slug}"))
-        presets[slug] = ModelProfile(
-            name=slug,
-            num_layers=int(entry["num_layers"]),
-            hidden_size=int(entry.get("hidden_size", 4096)),
-            intermediate_size=int(entry.get("intermediate_size", 11008)),
-            num_attention_heads=int(entry.get("num_attention_heads", 32)),
-            num_kv_heads=int(entry.get("num_kv_heads", 8)),
-            head_dim=int(entry.get("head_dim", 128)),
-            num_linear_layers=int(entry.get("num_linear_layers", 0)),
-            linear_key_heads=int(entry.get("linear_key_heads", 0)),
-            linear_value_heads=int(entry.get("linear_value_heads", 0)),
-            num_experts=int(entry.get("num_experts", 0)),
-            top_k=int(entry.get("top_k", 0)),
-            moe_intermediate_size=int(entry.get("moe_intermediate_size", 0)),
-            shared_expert_intermediate_size=int(
-                entry.get("shared_expert_intermediate_size", 0)
-            ),
-            num_moe_layers=int(entry.get("num_moe_layers", -1)),
-            kv_lora_rank=int(entry.get("kv_lora_rank", 0)),
-            q_lora_rank=int(entry.get("q_lora_rank", 0)),
-            qk_nope_head_dim=int(entry.get("qk_nope_head_dim", 0)),
-            qk_rope_head_dim=int(entry.get("qk_rope_head_dim", 0)),
-            routed_expert_hidden_size=int(entry.get("routed_expert_hidden_size", 0)),
-            weight_dtype=str(entry.get("weight_dtype", "fp8")),
-            expert_dtype=str(entry.get("expert_dtype", "")),
-            model_type=str(entry.get("model_type", "")),
-            has_attn_output_gate=bool(entry.get("has_attn_output_gate", False)),
-            kv_compress_factor=float(entry.get("kv_compress_factor", 1.0)),
-            residual_streams=int(entry.get("residual_streams", 1)),
-            layer_families=tuple(str(x) for x in entry.get("layer_families", ())),
-            unmodeled_features=tuple(
-                str(x) for x in entry.get("unmodeled_features", ())
-            ),
+        presets[slug] = finalize_model_profile(
+            ModelProfile(
+                name=slug,
+                num_layers=int(entry["num_layers"]),
+                hidden_size=int(entry.get("hidden_size", 4096)),
+                intermediate_size=int(entry.get("intermediate_size", 11008)),
+                num_attention_heads=int(entry.get("num_attention_heads", 32)),
+                num_kv_heads=int(entry.get("num_kv_heads", 8)),
+                head_dim=int(entry.get("head_dim", 128)),
+                num_linear_layers=int(entry.get("num_linear_layers", 0)),
+                linear_key_heads=int(entry.get("linear_key_heads", 0)),
+                linear_value_heads=int(entry.get("linear_value_heads", 0)),
+                num_experts=int(entry.get("num_experts", 0)),
+                top_k=int(entry.get("top_k", 0)),
+                moe_intermediate_size=int(entry.get("moe_intermediate_size", 0)),
+                shared_expert_intermediate_size=int(
+                    entry.get("shared_expert_intermediate_size", 0)
+                ),
+                num_moe_layers=int(entry.get("num_moe_layers", -1)),
+                kv_lora_rank=int(entry.get("kv_lora_rank", 0)),
+                q_lora_rank=int(entry.get("q_lora_rank", 0)),
+                qk_nope_head_dim=int(entry.get("qk_nope_head_dim", 0)),
+                qk_rope_head_dim=int(entry.get("qk_rope_head_dim", 0)),
+                routed_expert_hidden_size=int(
+                    entry.get("routed_expert_hidden_size", 0)
+                ),
+                weight_dtype=str(entry.get("weight_dtype", "fp8")),
+                expert_dtype=str(entry.get("expert_dtype", "")),
+                model_type=str(entry.get("model_type", "")),
+                has_attn_output_gate=bool(entry.get("has_attn_output_gate", False)),
+                kv_compress_factor=float(entry.get("kv_compress_factor", 1.0)),
+                residual_streams=int(entry.get("residual_streams", 1)),
+                layer_families=tuple(str(x) for x in entry.get("layer_families", ())),
+                unmodeled_features=tuple(
+                    str(x) for x in entry.get("unmodeled_features", ())
+                ),
+            )
         )
     aliases: dict[str, str] = {str(k): str(v) for k, v in payload["aliases"].items()}
     return presets, aliases, sources
@@ -827,31 +852,67 @@ class DeploymentPreset:
     prefill_windows: tuple[int, ...] = ()
 
 
+def _int_tuple(raw: object, field_name: str) -> tuple[int, ...]:
+    """Parse an integer tuple from JSON sequence, rejecting invalid scalars."""
+    if raw is None:
+        return ()
+    seq = _as_sequence(raw)
+    if seq is None:
+        msg = f"{field_name} must be a sequence of integers"
+        raise errors.MegakernelConfigError(msg)
+    out: list[int] = []
+    for item in seq:
+        match item:
+            case bool():
+                msg = f"{field_name} entries must be integers, got bool"
+                raise errors.MegakernelConfigError(msg)
+            case int():
+                out.append(item)
+            case _:
+                msg = (
+                    f"{field_name} entries must be integers, got {type(item).__name__}"
+                )
+                raise errors.MegakernelConfigError(msg)
+    return tuple(out)
+
+
+def _preset_int(raw: Mapping[str, object], key: str, default: int) -> int:
+    """Parse an integer preset field while rejecting bools and floats."""
+    val = raw.get(key, default)
+    match val:
+        case bool():
+            msg = f"Deployment preset {key!r} must be an integer, got bool"
+            raise errors.MegakernelConfigError(msg)
+        case int():
+            return val
+        case _:
+            msg = (
+                f"Deployment preset {key!r} must be an integer, "
+                f"got {type(val).__name__}"
+            )
+            raise errors.MegakernelConfigError(msg)
+
+
 def _parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
     """Parse a ParallelLayout mapping from deployments.json."""
-    raw_groups = raw.get("layer_groups")
-    groups: tuple[int, ...] = (
-        tuple(int(str(x)) for x in raw_groups)
-        if isinstance(raw_groups, (list, tuple))
-        else ()
-    )
-    mk_raw = raw.get("megakernel")
+    groups = _int_tuple(raw.get("layer_groups"), "layer_groups")
+    mk_map = _as_mapping(raw.get("megakernel"))
     mk_decl: Mapping[str, object] | None = None
-    if isinstance(mk_raw, Mapping):
-        if not str(mk_raw.get("source", "")).strip():
+    if mk_map is not None:
+        if not str(mk_map.get("source", "")).strip():
             msg = (
                 "megakernel declaration in deployments.json requires non-empty 'source'"
             )
             raise errors.MegakernelConfigError(msg)
-        mk_decl = dict(mk_raw)
+        mk_decl = dict(mk_map)
     return ParallelLayout(
-        tp=int(str(raw.get("tp", 1))),
-        ep=int(str(raw.get("ep", 1))),
-        dp=int(str(raw.get("dp", 1))),
-        pp=int(str(raw.get("pp", 1))),
-        dcp=int(str(raw.get("dcp", 1))),
-        pcp=int(str(raw.get("pcp", 1))),
-        spec_tokens=int(str(raw.get("spec_tokens", 0))),
+        tp=_preset_int(raw, "tp", 1),
+        ep=_preset_int(raw, "ep", 1),
+        dp=_preset_int(raw, "dp", 1),
+        pp=_preset_int(raw, "pp", 1),
+        dcp=_preset_int(raw, "dcp", 1),
+        pcp=_preset_int(raw, "pcp", 1),
+        spec_tokens=_preset_int(raw, "spec_tokens", 0),
         layer_groups=groups,
         megakernel=mk_decl,
     )
@@ -861,18 +922,15 @@ def _load_deployment_presets() -> tuple[
     Mapping[str, DeploymentPreset], Mapping[str, str]
 ]:
     """Load deployment layout presets and source strings from JSON."""
-    payload = json.loads((_PRESETS_DIR / "deployments.json").read_text("utf-8"))
+    payload = json.loads((PRESETS_DIR / "deployments.json").read_text("utf-8"))
     raw_deps = payload["deployments"]
     deps: dict[str, DeploymentPreset] = {}
     sources: dict[str, str] = {}
     for slug, entry in raw_deps.items():
         sources[slug] = str(entry.get("source", f"deployments.json:{slug}"))
-        sat_raw = entry.get("saturation")
-        sat = _parse_parallel_layout(sat_raw) if isinstance(sat_raw, Mapping) else None
-        win_raw = entry.get("prefill_windows")
-        windows: tuple[int, ...] = (
-            tuple(int(x) for x in win_raw) if isinstance(win_raw, (list, tuple)) else ()
-        )
+        sat_map = _as_mapping(entry.get("saturation"))
+        sat = _parse_parallel_layout(sat_map) if sat_map is not None else None
+        windows = _int_tuple(entry.get("prefill_windows"), "prefill_windows")
         deps[slug] = DeploymentPreset(
             decode=_parse_parallel_layout(entry["decode"]),
             prefill=_parse_parallel_layout(entry["prefill"]),
@@ -885,25 +943,38 @@ def _load_deployment_presets() -> tuple[
 DEPLOYMENT_PRESETS, DEPLOYMENT_PRESET_SOURCES = _load_deployment_presets()
 
 
+def _resolve_hf_profile(
+    raw_cfg: Mapping[str, object],
+    name: str,
+    dtypes: tuple[str | None, str | None, str, str],
+    *,
+    require_model_type: bool = False,
+) -> ModelProfile:
+    """Resolve normalized HuggingFace config with explicit dtype/state overrides."""
+    weight_dtype, expert_dtype, kv_dtype, state_dtype = dtypes
+    norm = _normalize_hf_config(raw_cfg)
+    norm.validate_supported(require_model_type=require_model_type)
+    return norm.to_model_profile(
+        name=name,
+        weight_dtype=weight_dtype,
+        expert_dtype=expert_dtype,
+        kv_dtype=kv_dtype,
+        state_dtype=state_dtype,
+    )
+
+
 def model_profile_from_hf_config(
     raw_cfg: Mapping[str, object],
     name: str = "model",
     weight_dtype: str | None = None,
     expert_dtype: str | None = None,
     kv_dtype: str = "fp8",
-    **extra_opts: object,
 ) -> ModelProfile:
     """Parse and validate a HuggingFace config mapping into a ModelProfile."""
-    norm = _normalize_hf_config(raw_cfg)
-    norm.validate_supported(
-        require_model_type=bool(extra_opts.get("require_model_type", False))
-    )
-    return norm.to_model_profile(
-        name=name,
-        weight_dtype=weight_dtype,
-        expert_dtype=expert_dtype,
-        kv_dtype=kv_dtype,
-        state_dtype=str(extra_opts.get("state_dtype") or "bf16"),
+    return _resolve_hf_profile(
+        raw_cfg,
+        name,
+        (weight_dtype, expert_dtype, kv_dtype, "bf16"),
     )
 
 
@@ -944,40 +1015,31 @@ def resolve_model_profile(
     state_dtype: str | None = None,
 ) -> ModelProfile:
     """Resolve a ModelProfile from a preset, repo alias, dict, or config path."""
-    if isinstance(target, ModelProfile):
-        return target
     kv_val = (kv_dtype or "fp8").lower()
     st_val = (state_dtype or "bf16").lower()
-    if isinstance(target, Mapping):
-        return model_profile_from_hf_config(
-            target,
-            "model",
-            weight_dtype,
-            expert_dtype,
-            kv_val,
-            state_dtype=st_val,
-        )
+    dtypes = (weight_dtype, expert_dtype, kv_val, st_val)
+    match target:
+        case ModelProfile():
+            return target
+        case Mapping() as mapping:
+            return _resolve_hf_profile(mapping, "model", dtypes)
+        case _:
+            pass
 
     raw_str = str(target).strip()
     path = Path(raw_str)
     if path.is_file():
-        return model_profile_from_hf_config(
+        return _resolve_hf_profile(
             json.loads(path.read_text("utf-8")),
             path.parent.name or path.stem,
-            weight_dtype,
-            expert_dtype,
-            kv_val,
-            state_dtype=st_val,
+            dtypes,
         )
     if not raw_str.endswith(".json") and (path / "config.json").is_file():
         cfg_file = path / "config.json"
-        return model_profile_from_hf_config(
+        return _resolve_hf_profile(
             json.loads(cfg_file.read_text("utf-8")),
             path.name or cfg_file.stem,
-            weight_dtype,
-            expert_dtype,
-            kv_val,
-            state_dtype=st_val,
+            dtypes,
         )
 
     tail = raw_str.lower().strip("/").split("/")[-1]
@@ -998,13 +1060,10 @@ def resolve_model_profile(
 
     snap_cfg = resolve_hf_snapshot_config(raw_str)
     if snap_cfg is not None:
-        return model_profile_from_hf_config(
+        return _resolve_hf_profile(
             json.loads(snap_cfg.read_text("utf-8")),
             tail,
-            weight_dtype,
-            expert_dtype,
-            kv_val,
-            state_dtype=st_val,
+            dtypes,
             require_model_type=True,
         )
 
