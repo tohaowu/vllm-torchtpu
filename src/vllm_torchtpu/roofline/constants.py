@@ -137,6 +137,8 @@ MATMUL_FLOP_PER_MAC: float = 2.0
 UNIT_KILO: float = 1.0e3
 UNIT_MEGA: float = 1.0e6
 UNIT_GIGA: float = 1.0e9
+UNIT_TERA: float = 1.0e12
+UNIT_PETA: float = 1.0e15
 UNIT_MILLIS_PER_SECOND: float = 1.0e3
 UNIT_MICROS_PER_SECOND: float = 1.0e-6
 
@@ -209,3 +211,7 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v1"
 MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
+
+# Self-contained HTML report constants.
+MAX_EMBEDDED_CANDIDATES: int = 2000
+MIN_FRONTIER_POINTS_FOR_POLYLINE: int = 2
