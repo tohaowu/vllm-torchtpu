@@ -32,6 +32,7 @@ from .collectives import (
 )
 from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
+    DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     MAX_EMBEDDED_CANDIDATES,
@@ -51,6 +52,7 @@ from .emit import (
     emit_launch_args,
     point_launch_args,
     pool_cli_args,
+    pool_label,
     top_layouts,
 )
 from .geometry import (
@@ -97,6 +99,7 @@ from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_flo
 __all__ = [
     "CHIPS",
     "DEFAULT_GPU_MEMORY_UTILIZATION",
+    "DEFAULT_TOP_K",
     "EXAMPLE_CONCURRENCIES",
     "EXAMPLE_SCENARIOS",
     "EXAMPLE_SLO_TIERS",
@@ -157,6 +160,7 @@ __all__ = [
     "plan",
     "point_launch_args",
     "pool_cli_args",
+    "pool_label",
     "render_html",
     "solve_serving_plan",
     "spec_cycle_floor",

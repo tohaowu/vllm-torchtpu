@@ -143,6 +143,7 @@ def test_report_without_feasible_layout(sample_payload: SolvePayload) -> None:
 
 def test_report_caps_embedded_candidates(sample_payload: SolvePayload) -> None:
     """Payloads with large candidate counts downsample embedded JSON."""
+    expected_cap = 200
     payload: dict[str, object] = dict(sample_payload)
     cands = sample_payload["candidates"]
     base_cand = cands[0] if cands else {}
@@ -154,7 +155,8 @@ def test_report_caps_embedded_candidates(sample_payload: SolvePayload) -> None:
     assert match is not None
     raw_json = match.group(1).replace(r"<\/", "</")
     embedded = json.loads(raw_json)
-    assert len(embedded["candidates"]) <= MAX_EMBEDDED_CANDIDATES
+    assert expected_cap == MAX_EMBEDDED_CANDIDATES
+    assert len(embedded["candidates"]) == MAX_EMBEDDED_CANDIDATES
 
 
 def test_report_slo_unmet_recommended_renders_warning_banner(
@@ -331,3 +333,26 @@ def test_pool_label_omits_single_count_and_lists_axes(
 ) -> None:
     """A single-instance pool shows no count; only axes above 1 are listed."""
     assert pool_label({**_BASE_POOL, **overrides}) == expected
+
+
+def test_render_html_caps_svg_background_circles(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify SVG scatter caps background dots at <= 1200 and marks Top-k rings."""
+    max_bg_dots = 1200
+    payload: dict[str, object] = json.loads(json.dumps(sample_payload))
+    cands = list(sample_payload.get("candidates", ()))
+    base = dict(cands[0])
+    spread: list[dict[str, object]] = []
+    n_pts = 5000
+    for i in range(n_pts):
+        pt = dict(base)
+        pt["concurrency"] = (i % 128) + 1
+        pt["token_throughput_per_chip"] = 100.0 + float((i * 37) % 10000)
+        pt["est_interactivity_tok_s"] = 10.0 + float((i * 53) % 1000)
+        spread.append(pt)
+    payload["candidates"] = spread
+    html = render_html(payload)
+    bg_circles = len(re.findall(r'<circle [^>]*fill="#cbd5e1"', html))
+    assert 1 <= bg_circles <= max_bg_dots
+    assert "#10b981" in html

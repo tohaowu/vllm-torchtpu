@@ -25,8 +25,10 @@ from .chips import CHIPS, ChipSpec, chip_catalog, format_constant_display
 from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
     MAX_EMBEDDED_CANDIDATES,
+    MAX_SVG_BG_POINTS,
     MIN_FRONTIER_POINTS_FOR_POLYLINE,
     PREFIX_RANGE_PAIR_LEN,
+    SVG_GRID_CELL_PX,
     UNIT_GIGA,
     UNIT_MEGA,
     UNIT_PETA,
@@ -72,9 +74,35 @@ def _escape(val: object) -> str:
     return html.escape(str(val))
 
 
+def _downsample_svg_points(
+    points: Sequence[Mapping[str, object]],
+    bounds: tuple[float, float],
+    plot_size: tuple[int, int],
+) -> list[Mapping[str, object]]:
+    """Deduplicate dense scatter points on a 2D pixel grid while preserving envelope."""
+    max_x, max_y = bounds
+    plot_w, plot_h = plot_size
+    if len(points) <= MAX_SVG_BG_POINTS:
+        return list(points)
+    seen: set[tuple[int, int]] = set()
+    deduped: list[Mapping[str, object]] = []
+    for p in points:
+        px = (_as_float(p.get("token_throughput_per_chip")) / max_x) * plot_w
+        py = (_as_float(p.get("est_interactivity_tok_s")) / max_y) * plot_h
+        cell = (int(px // SVG_GRID_CELL_PX), int(py // SVG_GRID_CELL_PX))
+        if cell not in seen:
+            seen.add(cell)
+            deduped.append(p)
+    if len(deduped) <= MAX_SVG_BG_POINTS:
+        return deduped
+    stride = math.ceil(len(deduped) / MAX_SVG_BG_POINTS)
+    return deduped[::stride][:MAX_SVG_BG_POINTS]
+
+
 def _render_frontier_svg(
     points: Sequence[Mapping[str, object]],
     frontier: Sequence[Mapping[str, object]],
+    top_k: Sequence[Mapping[str, object]] = (),
 ) -> str:
     """Render inline SVG Pareto frontier scatter plot."""
     width, height = 720, 360
@@ -150,17 +178,12 @@ def _render_frontier_svg(
             ]
         )
 
-    for p in all_pts:
+    for p in _downsample_svg_points(all_pts, (max_x, max_y), (plot_w, plot_h)):
         tput = _as_float(p.get("token_throughput_per_chip"))
         inter = _as_float(p.get("est_interactivity_tok_s"))
-        t_tip = (
-            f"c={_as_int(p.get('concurrency'), 1)} | "
-            f"{tput:.1f} tok/s/chip | {inter:.1f} tok/s"
-        )
         svg_parts.append(
             f'<circle cx="{scale_x(tput):.1f}" cy="{scale_y(inter):.1f}" r="3" '
-            'fill="#cbd5e1" stroke="#94a3b8" stroke-width="0.5" opacity="0.7">'
-            f"<title>{_escape(t_tip)}</title></circle>"
+            'fill="#cbd5e1" stroke="#94a3b8" stroke-width="0.5" opacity="0.7"/>'
         )
 
     sorted_f = sorted(
@@ -190,6 +213,22 @@ def _render_frontier_svg(
             f'<circle cx="{scale_x(tput):.1f}" cy="{scale_y(inter):.1f}" r="5.5" '
             'fill="#1d4ed8" stroke="#ffffff" stroke-width="1.5">'
             f"<title>{_escape(f_tip)}</title></circle>"
+        )
+
+    for rank, entry in enumerate(top_k, 1):
+        pt = _as_mapping(entry.get("point"))
+        if not pt:
+            continue
+        cx_k = scale_x(_as_float(pt.get("token_throughput_per_chip")))
+        cy_k = scale_y(_as_float(pt.get("est_interactivity_tok_s")))
+        svg_parts.extend(
+            [
+                f'<circle cx="{cx_k:.1f}" cy="{cy_k:.1f}" r="8.5" '
+                'fill="none" stroke="#10b981" stroke-width="2.0"/>',
+                f'<text x="{cx_k + 10:.1f}" y="{cy_k - 6:.1f}" '
+                'font-size="10" font-weight="700" fill="#065f46">'
+                f"#{rank}</text>",
+            ]
         )
 
     svg_parts.append("</svg>")
@@ -893,7 +932,9 @@ def render_html(payload: Mapping[str, object]) -> str:
     embedded_payload = dict(payload)
     embedded_payload.pop("sweep_candidates", None)
     embedded_payload["candidates"] = _downsample_embedded_candidates(candidates)
-    embedded_json = json.dumps(embedded_payload, indent=2).replace("</", "<\\/")
+    embedded_json = json.dumps(embedded_payload, separators=(",", ":")).replace(
+        "</", "<\\/"
+    )
 
     if rec is not None and not bool(rec.get("slo_met", True)) and not warnings:
         warnings = [
@@ -905,7 +946,7 @@ def render_html(payload: Mapping[str, object]) -> str:
     decode_floor = _as_mapping(decode_floor_raw) if decode_floor_raw else None
     default_limit_gb = _derive_default_hbm_limit_gb(payload)
 
-    frontier_svg = _render_frontier_svg(candidates, frontier)
+    frontier_svg = _render_frontier_svg(candidates, frontier, top_k=top_k)
     limits_svg = _render_limits_svg(decode_floor)
     memory_svg = _render_memory_svg(pools_list, default_limit_gb)
 

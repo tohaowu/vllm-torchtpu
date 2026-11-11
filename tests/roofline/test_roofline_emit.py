@@ -809,3 +809,227 @@ def test_emit_dispatch_env_and_enable_ep_for_fused_rs() -> None:
     rs_cmd = point_launch_args(rs_pt, LaunchOptions(model="m"))["commands"][0]
     assert "TPU_MOE_SEQUENCE_PARALLEL=1" in rs_cmd
     assert "--enable-expert-parallel" in rs_cmd
+
+
+def _synthetic_pareto_point(
+    mode: Literal["mixed", "disagg"],
+    pools: tuple[PoolMeshPlan | None, PoolMeshPlan],
+    conc: int,
+    tput: float,
+    inter: float,
+) -> ParetoPoint:
+    """Create a synthetic SLO-met ParetoPoint fixture from prefill/decode pools."""
+    pref, dec = pools
+    chips = (
+        pref.instances * pref.chips_per_instance if pref is not None else 0
+    ) + dec.instances * dec.chips_per_instance
+    return ParetoPoint(
+        mode=mode,
+        concurrency=conc,
+        total_chips=chips,
+        prefill_pool=pref,
+        decode_pool=dec,
+        est_ttft_ms=100.0,
+        est_tpot_ms=1000.0 / inter,
+        est_interactivity_tok_s=inter,
+        output_throughput_per_chip=tput * 0.1,
+        token_throughput_per_chip=tput,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+
+
+def _agentic_scenario(name: str = "agentic-64k") -> TrafficScenario:
+    """Build synthetic TrafficScenario fixture for Top-K diversity tests."""
+    return TrafficScenario(
+        name=name,
+        isl=65536,
+        osl=1024,
+        prefix_hit_rate=0.88,
+        accept_len=3.0,
+        think_time_s=0.0,
+        concurrencies=(1, 64, 256),
+        kv_working_set_turns=1.0,
+    )
+
+
+def test_top_layouts_k5_surfaces_diverse_frontiers_and_pp8() -> None:
+    """Verify k=5 surfaces PP>=8 and diverse archetypes behind dense anchors."""
+    expected_top_5 = 5
+    expected_top_3 = 3
+    pp_8 = 8
+    scen = _agentic_scenario()
+    m_base = _sample_pool(
+        role="mixed", cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=8, ep=16)
+    )
+    m_dcp2 = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=4, ep=16, kv_split=2),
+    )
+    m_dcp4 = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=2, ep=16, kv_split=4),
+    )
+    m_dcp8 = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=1, ep=16, kv_split=8),
+    )
+    m_fast = _sample_pool(
+        role="mixed", cfg=_PoolConfig(topology="2x2x2", chips=8, tp=16, dp=1, ep=16)
+    )
+    p_pp8 = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=1, pp=pp_8, pcp=1),
+    )
+    p_pcp8 = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=8, pp=1, pcp=8),
+    )
+    d_tp8 = _sample_pool(
+        role="decode", cfg=_PoolConfig(topology="2x2x2", chips=8, tp=8, dp=2, ep=16)
+    )
+
+    c_base = _synthetic_pareto_point("mixed", (None, m_base), 256, 10000.0, 50.0)
+    c_d2 = _synthetic_pareto_point("mixed", (None, m_dcp2), 256, 9900.0, 51.0)
+    c_d4 = _synthetic_pareto_point("mixed", (None, m_dcp4), 256, 9800.0, 52.0)
+    c_d8 = _synthetic_pareto_point("mixed", (None, m_dcp8), 256, 9700.0, 53.0)
+    c_pp8 = _synthetic_pareto_point("disagg", (p_pp8, d_tp8), 64, 7000.0, 220.0)
+    c_pcp8 = _synthetic_pareto_point("disagg", (p_pcp8, d_tp8), 64, 6500.0, 260.0)
+    c_fast = _synthetic_pareto_point("mixed", (None, m_fast), 1, 1500.0, 900.0)
+
+    splan = ServingPlan(
+        model_layers=60,
+        chip="tpu7x",
+        scenario=scen,
+        mode="auto",
+        recommended=c_base,
+        frontier=(c_fast, c_pcp8, c_pp8, c_d8, c_d4, c_d2, c_base),
+        warnings=(),
+        candidates=(c_base, c_d2, c_d4, c_d8, c_pp8, c_pcp8, c_fast),
+    )
+    top5 = top_layouts(splan)
+    assert len(top5) == expected_top_5
+    assert c_base in top5
+    assert c_fast in top5
+    assert c_pp8 in top5
+    assert c_pcp8 in top5
+    assert len(top_layouts(splan, k=expected_top_3)) == expected_top_3
+
+
+def test_top_layouts_k5_surfaces_pp8_over_pp2_pcp4() -> None:
+    """Verify k=5 still surfaces PP8 when Rank-1 is disagg PP2+PCP4 across 8+ keys."""
+    expected_top_5 = 5
+    pp_8 = 8
+    m_base = _sample_pool(
+        role="mixed", cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=8, ep=16)
+    )
+    p_pp2 = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=4, pp=2, pcp=4),
+    )
+    p_pp8 = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=1, pp=pp_8, pcp=1),
+    )
+    p_pcp8 = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=8, pp=1, pcp=8),
+    )
+    d_tp4 = _sample_pool(
+        role="decode", cfg=_PoolConfig(topology="2x2x1", chips=4, tp=4, dp=2, ep=8)
+    )
+    d_tp4_dcp2 = _sample_pool(
+        role="decode",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=4, dp=1, ep=8, kv_split=2),
+    )
+    d_tp8 = _sample_pool(
+        role="decode", cfg=_PoolConfig(topology="2x2x2", chips=8, tp=8, dp=2, ep=16)
+    )
+    d_tp8_dcp2 = _sample_pool(
+        role="decode",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=8, dp=1, ep=16, kv_split=2),
+    )
+    d_tp16 = _sample_pool(
+        role="decode",
+        cfg=_PoolConfig(instances=2, topology="2x2x2", chips=8, tp=16, dp=1, ep=16),
+    )
+    a_pp2 = _synthetic_pareto_point("disagg", (p_pp2, d_tp8), 256, 12000.0, 80.0)
+    a_pp2_b = _synthetic_pareto_point(
+        "disagg", (p_pp2, d_tp8_dcp2), 128, 11200.0, 105.0
+    )
+    a_pp2_c = _synthetic_pareto_point("disagg", (p_pp2, d_tp4), 128, 10400.0, 130.0)
+    a_pp2_d = _synthetic_pareto_point("disagg", (p_pp2, d_tp4_dcp2), 64, 9600.0, 155.0)
+    b_mix = _synthetic_pareto_point("mixed", (None, m_base), 64, 8500.0, 180.0)
+    b_pp8 = _synthetic_pareto_point("disagg", (p_pp8, d_tp8), 64, 7800.0, 240.0)
+    b_pp2_mid = _synthetic_pareto_point("disagg", (p_pp2, d_tp16), 32, 6200.0, 480.0)
+    b_fast = _synthetic_pareto_point("disagg", (p_pcp8, d_tp16), 1, 2000.0, 950.0)
+    pp2_frontier = (
+        b_fast,
+        b_pp2_mid,
+        b_pp8,
+        b_mix,
+        a_pp2_d,
+        a_pp2_c,
+        a_pp2_b,
+        a_pp2,
+    )
+    splan_pp2 = ServingPlan(
+        model_layers=60,
+        chip="tpu7x",
+        scenario=_agentic_scenario(),
+        mode="auto",
+        recommended=a_pp2,
+        frontier=pp2_frontier,
+        warnings=(),
+        candidates=tuple(reversed(pp2_frontier)),
+    )
+    top5_pp2 = top_layouts(splan_pp2, k=expected_top_5)
+    assert len(top5_pp2) == expected_top_5
+    assert b_pp8 in top5_pp2
+    assert all(pt in pp2_frontier for pt in top5_pp2)
+
+
+def test_top_layouts_k5_selects_actual_frontier_over_off_frontier_candidates() -> None:
+    """Verify k=5 never replaces a frontier layout point with a dominated candidate."""
+    expected_top_5 = 5
+    scen = _agentic_scenario(name="frontier_only")
+    m_f1 = _sample_pool("mixed", _PoolConfig(topology="2x2x2", chips=8, tp=2, dp=8))
+    m_f2 = _sample_pool("mixed", _PoolConfig(topology="2x2x2", chips=8, tp=4, dp=4))
+    m_f3 = _sample_pool("mixed", _PoolConfig(topology="2x2x2", chips=8, tp=8, dp=2))
+    m_f4 = _sample_pool(
+        "mixed", _PoolConfig(topology="2x2x2", chips=8, tp=4, dp=2, kv_split=2)
+    )
+    m_f5 = _sample_pool("mixed", _PoolConfig(topology="2x2x2", chips=8, tp=16, dp=1))
+    m_off = _sample_pool(
+        "mixed", _PoolConfig(topology="2x2x2", chips=8, tp=2, dp=4, kv_split=2)
+    )
+
+    f1 = _synthetic_pareto_point("mixed", (None, m_f1), 256, 10000.0, 90.0)
+    # Same structural key as f2, higher throughput at c=256, strictly dominated by f1.
+    f2_off_hi = _synthetic_pareto_point("mixed", (None, m_f2), 256, 9800.0, 60.0)
+    f2_on = _synthetic_pareto_point("mixed", (None, m_f2), 64, 9000.0, 140.0)
+    # Wholly non-frontier structural key, higher throughput than f2_on, dominated by f1.
+    g_off = _synthetic_pareto_point("mixed", (None, m_off), 256, 9700.0, 65.0)
+    f3 = _synthetic_pareto_point("mixed", (None, m_f3), 32, 7500.0, 260.0)
+    f4 = _synthetic_pareto_point("mixed", (None, m_f4), 16, 5200.0, 480.0)
+    f5 = _synthetic_pareto_point("mixed", (None, m_f5), 1, 2200.0, 920.0)
+
+    frontier = (f5, f4, f3, f2_on, f1)
+    splan = ServingPlan(
+        model_layers=60,
+        chip="tpu7x",
+        scenario=scen,
+        mode="mixed",
+        recommended=f1,
+        frontier=frontier,
+        warnings=(),
+        candidates=(f1, f2_off_hi, g_off, f2_on, f3, f4, f5),
+    )
+    top5 = top_layouts(splan, k=expected_top_5)
+    assert len(top5) == expected_top_5
+    assert all(pt in frontier for pt in top5)
+    assert f2_off_hi not in top5
+    assert g_off not in top5
+    assert f2_on in top5

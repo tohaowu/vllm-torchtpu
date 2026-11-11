@@ -2328,3 +2328,85 @@ def test_scale_pp_stage_floor_scales_strict_bounds_with_layer_ratio() -> None:
         moe_even.fp8_flops_min * ratio, rel=1e-9
     )
     assert sf_scaled.hbm_bound_s > sf_even.hbm_bound_s * 1.5
+
+
+def test_example_scenario_agentic_64k_preset() -> None:
+    """Verify agentic-64k preset defines 64K ISL, 88% hit, and MTP-3 batch sweep."""
+    assert "agentic-64k" in rf.EXAMPLE_SCENARIOS
+    scen = rf.EXAMPLE_SCENARIOS["agentic-64k"]
+    expected_isl = 65536
+    expected_osl = 1024
+    expected_chunk = 2048
+    expected_spec = 3
+    assert scen.isl == expected_isl
+    assert scen.osl == expected_osl
+    assert scen.prefix_hit_rate == pytest.approx(0.88)
+    assert scen.accept_len == pytest.approx(3.0)
+    assert scen.spec_tokens == expected_spec
+    assert scen.prefill_chunk == expected_chunk
+    assert scen.concurrencies == (1, 4, 8, 16, 32, 64, 128, 256)
+
+
+def test_disagg_max_instances_2_enforces_strict_1p1d() -> None:
+    """Verify --max-instances bounds total x_p + y_d instances in disaggregated mode."""
+    geom = rf.from_hf_config(
+        {
+            "model_type": "qwen3_moe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "intermediate_size": 4096,
+            "moe_intermediate_size": 1024,
+            "num_experts": 32,
+            "num_experts_per_tok": 4,
+            "vocab_size": 32000,
+        }
+    )
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes(kv=1.0)
+    scen = dc_replace(
+        rf.EXAMPLE_SCENARIOS["chat-8k1k"],
+        isl=2048,
+        osl=256,
+        concurrencies=(1, 16),
+    )
+    max_inst_2 = 2
+    plan_2 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="disagg", max_instances=max_inst_2),
+    )
+    assert len(plan_2.candidates) > 0
+    for pt in plan_2.candidates:
+        assert pt.prefill_pool is not None
+        assert pt.prefill_pool.instances == 1
+        assert pt.decode_pool.instances == 1
+        assert pt.prefill_pool.instances + pt.decode_pool.instances <= max_inst_2
+
+    max_inst_3 = 3
+    plan_3 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="disagg", max_instances=max_inst_3),
+    )
+    assert len(plan_3.candidates) > 0
+    assert all(
+        pt.prefill_pool is not None
+        and pt.prefill_pool.instances + pt.decode_pool.instances <= max_inst_3
+        for pt in plan_3.candidates
+    )
+
+    plan_1 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="disagg", max_instances=1),
+    )
+    assert len(plan_1.candidates) == 0

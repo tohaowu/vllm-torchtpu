@@ -32,11 +32,14 @@ from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PREFILL_CHUNK,
+    DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
     FP8_BYTES,
     KV_DTYPE_BYTES,
+    MIN_INSTANCES,
+    MIN_TOP_K,
     STATE_DTYPE_BYTES,
     UNIT_GIGA,
     UNIT_KILO,
@@ -49,6 +52,8 @@ from .emit import (
     emit_ceiling_rows,
     emit_launch_args,
     pool_label,
+    top_layout_roles,
+    top_layouts,
 )
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
@@ -605,6 +610,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(unit: path, scope: command)."
         ),
     )
+    p_solve.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help=(
+            "Maximum diverse Pareto layouts to display and emit "
+            "(unit: count, scope: command)."
+        ),
+    )
 
     p_emit = sub.add_parser("emit", help="Emit vllm serve flags.")
     _add_scenario_args(p_emit)
@@ -1011,6 +1025,39 @@ def _render_emit_cmd(
     return 0
 
 
+def _render_solve_ascii_table(splan: ServingPlan, top_k: int) -> None:
+    """Write Top-K diverse Pareto layouts as an aligned terminal table."""
+    top_pts = top_layouts(splan, k=top_k)
+    annotated = top_layout_roles(top_pts)
+    pool_labels = [
+        (
+            f"P {pool_label(asdict(pt.prefill_pool))} + "
+            f"D {pool_label(asdict(pt.decode_pool))}"
+            if pt.prefill_pool is not None
+            else pool_label(asdict(pt.decode_pool))
+        )
+        for pt, _, _ in annotated
+    ]
+    pw = max([len("pools"), *(len(p) for p in pool_labels)])
+    sys.stdout.write(
+        f"{'rank':>4}  {'role':<17}  {'margin':>7}  {'mode':<7}  {'c':>5}  "
+        f"{'chips':>5}  {'pools':<{pw}}  {'est_int_tok_s':>13}  "
+        f"{'tok_tput_chip':>13}  {'bound_tpot_ms':>13}  {'est_ttft_ms':>11}  "
+        f"{'est_tpot_ms':>11}\n",
+    )
+    for rank, ((pt, role, margin), pools) in enumerate(
+        zip(annotated, pool_labels, strict=True), 1
+    ):
+        sys.stdout.write(
+            f"{rank:>4}  {role:<17}  {margin:>+6.1f}%  {pt.mode:<7}  "
+            f"{pt.concurrency:>5}  {pt.total_chips:>5}  {pools:<{pw}}  "
+            f"{pt.est_interactivity_tok_s:>13.2f}  "
+            f"{pt.token_throughput_per_chip:>13.1f}  "
+            f"{pt.bound_tpot_ms:>13.2f}  "
+            f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n",
+        )
+
+
 def _render_solve_output(
     args: argparse.Namespace,
     splan: ServingPlan,
@@ -1019,7 +1066,9 @@ def _render_solve_output(
     """Render solve subcommand HTML, JSON, or text table and return exit code."""
     chip, dt_auto, src = meta
     if args.html is not None:
-        payload_html = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
+        payload_html = build_solve_payload(
+            splan, chip=chip, dtypes=dt_auto, model=src, top_k=args.top_k
+        )
         write_html(payload_html, args.html)
     warnings_to_emit = list(splan.warnings)
     if not splan.frontier and not warnings_to_emit:
@@ -1030,39 +1079,21 @@ def _render_solve_output(
         sys.stderr.write(f"WARNING: {w}\n")
     if not splan.frontier:
         if args.json:
-            payload = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
+            payload = build_solve_payload(
+                splan, chip=chip, dtypes=dt_auto, model=src, top_k=args.top_k
+            )
             sys.stdout.write(json.dumps(payload) + "\n")
         return _EXIT_EMPTY_FRONTIER
     if args.json:
-        payload = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
+        payload = build_solve_payload(
+            splan, chip=chip, dtypes=dt_auto, model=src, top_k=args.top_k
+        )
         sys.stdout.write(json.dumps(payload) + "\n")
         return 0
-    pool_labels = [
-        (
-            f"P {pool_label(asdict(pt.prefill_pool))} + "
-            f"D {pool_label(asdict(pt.decode_pool))}"
-            if pt.prefill_pool is not None
-            else pool_label(asdict(pt.decode_pool))
-        )
-        for pt in splan.frontier
-    ]
-    pw = max(len("pools"), *(len(p) for p in pool_labels))
-    sys.stdout.write(
-        f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<{pw}}  "
-        f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'bound_tpot_ms':>13}  "
-        f"{'est_ttft_ms':>11}  {'est_tpot_ms':>11}\n",
-    )
-    for pt, pools in zip(splan.frontier, pool_labels, strict=True):
-        sys.stdout.write(
-            f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
-            f"{pools:<{pw}}  {pt.est_interactivity_tok_s:>13.2f}  "
-            f"{pt.token_throughput_per_chip:>13.1f}  "
-            f"{pt.bound_tpot_ms:>13.2f}  "
-            f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n",
-        )
+    _render_solve_ascii_table(splan, args.top_k)
     sys.stdout.write(
         "# Note: bound_* columns are hard physical lower bounds; "
-        "est_* columns are model estimates.\n"
+        "est_* columns are model estimates.\n",
     )
     return 0
 
@@ -1092,6 +1123,12 @@ def _dispatch_solve_family(
     parsed: tuple[dict[str, object], dict[str, object]],
 ) -> int:
     """Execute solve, emit, or ceiling subcommands."""
+    if args.cmd == "solve" and args.top_k < MIN_TOP_K:
+        parser.error(f"--top-k must be >= {MIN_TOP_K}, got {args.top_k}")
+    if args.max_instances is not None and args.max_instances < MIN_INSTANCES:
+        parser.error(
+            f"--max-instances must be >= {MIN_INSTANCES}, got {args.max_instances}"
+        )
     src, cfg, geom, chip = model_ctx
     serve_parsed, _ = parsed
     scen, eff_gmu, cmd_max_model_len = _build_cli_scenario(args, parser, parsed)

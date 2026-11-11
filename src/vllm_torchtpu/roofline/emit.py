@@ -15,20 +15,24 @@
 
 from __future__ import annotations
 
+import math
 import shlex
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Final, TypedDict, cast
 
 from .chips import JAX_VERSION, ChipSpec, chip_catalog
 from .constants import (
+    DEEP_PP_THRESHOLD,
+    DEFAULT_TOP_K,
     KV_DTYPE_BYTES,
+    MIN_DIVERSE_TOP_LAYOUTS,
     MIN_TOP_LAYOUTS_FOR_FASTEST,
     PERCENT_SCALE,
     SOLVE_SCHEMA,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from .modules import Dtypes
     from .solver import ParetoPoint, PoolMeshPlan, ServingPlan
@@ -252,18 +256,169 @@ def _point_struct_key(
     return (pt.mode, _pool_key(pt.prefill_pool), _pool_key(pt.decode_pool))
 
 
-def top_layouts(plan: ServingPlan, k: int = 3) -> tuple[ParetoPoint, ...]:
-    """Select up to k structurally distinct SLO-met layouts spanning Pareto roles."""
-    if k <= 0:
-        return ()
+def _coarse_pool_key(pool: PoolMeshPlan | None) -> tuple[object, ...] | None:
+    """Group PoolMeshPlan variants by coarse parallelism archetype."""
+    if pool is None:
+        return None
+    return (
+        pool.topology,
+        pool.instances > 1,
+        pool.pp >= DEEP_PP_THRESHOLD,
+        pool.pp > 1,
+        pool.pcp > 1,
+        pool.kv_split > 1,
+        pool.tp > 1,
+        pool.dp > 1,
+    )
+
+
+def _coarse_family_key(
+    pt: ParetoPoint,
+) -> tuple[str, tuple[object, ...] | None, tuple[object, ...] | None]:
+    """Build coarse archetype identity key across mixed or prefill/decode pools."""
+    return (
+        pt.mode,
+        _coarse_pool_key(pt.prefill_pool),
+        _coarse_pool_key(pt.decode_pool),
+    )
+
+
+def _select_compact_top_layouts(
+    ranked: list[ParetoPoint],
+    fastest: ParetoPoint,
+    k: int,
+) -> tuple[ParetoPoint, ...]:
+    """Preserve compact Top-K selection when k <= 3."""
+    if len(ranked) <= 1 or k < MIN_TOP_LAYOUTS_FOR_FASTEST:
+        return tuple(ranked[:k])
+    selected = list(ranked[:k])
+    f_key = _point_struct_key(fastest)
+    sel_keys = [_point_struct_key(p) for p in selected]
+    if f_key not in sel_keys:
+        selected[-1] = fastest
+    elif sel_keys.index(f_key) > 0:
+        selected[sel_keys.index(f_key)] = fastest
+    selected.sort(key=lambda p: -p.token_throughput_per_chip)
+    return tuple(selected)
+
+
+def _diversity_score(
+    pt: ParetoPoint,
+    chosen: list[ParetoPoint],
+    meta: tuple[float, float, bool],
+) -> tuple[int, int, int, int, int, int, float, float]:
+    """Score a candidate by frontier status, uncovered archetype axes, and spread."""
+    max_tput, max_inter, is_frontier = meta
+    seen_modes = {c.mode for c in chosen}
+    seen_fams = {_coarse_family_key(c) for c in chosen}
+    has_deep_pp = any(
+        c.prefill_pool is not None and c.prefill_pool.pp >= DEEP_PP_THRESHOLD
+        for c in chosen
+    )
+    has_pp = any(c.prefill_pool is not None and c.prefill_pool.pp > 1 for c in chosen)
+    has_pcp = any(c.prefill_pool is not None and c.prefill_pool.pcp > 1 for c in chosen)
+    pref = pt.prefill_pool
+    new_mode = int(pt.mode not in seen_modes)
+    new_deep_pp = int(
+        not has_deep_pp and pref is not None and pref.pp >= DEEP_PP_THRESHOLD
+    )
+    new_pp = int(not has_pp and pref is not None and pref.pp > 1)
+    new_pcp = int(not has_pcp and pref is not None and pref.pcp > 1)
+    new_fam = int(_coarse_family_key(pt) not in seen_fams)
+    min_dist = min(
+        math.hypot(
+            (pt.token_throughput_per_chip - c.token_throughput_per_chip) / max_tput,
+            (pt.est_interactivity_tok_s - c.est_interactivity_tok_s) / max_inter,
+        )
+        for c in chosen
+    )
+    norm_tput = pt.token_throughput_per_chip / max_tput
+    return (
+        int(is_frontier),
+        new_mode,
+        new_deep_pp,
+        new_pp,
+        new_pcp,
+        new_fam,
+        min_dist,
+        norm_tput,
+    )
+
+
+def _select_diverse_top_layouts(
+    ranked: list[ParetoPoint],
+    fastest: ParetoPoint,
+    frontier_keys: set[
+        tuple[str, tuple[object, ...] | None, tuple[object, ...] | None]
+    ],
+    k: int,
+) -> tuple[ParetoPoint, ...]:
+    """Select Rank-1, Max-Interactivity, and diverse frontier knees up to k."""
+    if len(ranked) <= k:
+        selected = list(ranked)
+    else:
+        max_tput = max(p.token_throughput_per_chip for p in ranked) or 1.0
+        max_inter = max(p.est_interactivity_tok_s for p in ranked) or 1.0
+        chosen: list[ParetoPoint] = [ranked[0]]
+        chosen_keys = {_point_struct_key(ranked[0])}
+        remaining = list(ranked[1:])
+        while remaining and len(chosen) < max(1, k - 1):
+            best_pt = max(
+                remaining,
+                key=lambda p: _diversity_score(
+                    p,
+                    chosen,
+                    (max_tput, max_inter, _point_struct_key(p) in frontier_keys),
+                ),
+            )
+            chosen.append(best_pt)
+            chosen_keys.add(_point_struct_key(best_pt))
+            remaining = [
+                p for p in remaining if _point_struct_key(p) not in chosen_keys
+            ]
+        if len(chosen) < k and remaining:
+            last_pt = max(
+                remaining,
+                key=lambda p: _diversity_score(
+                    p,
+                    chosen,
+                    (max_tput, max_inter, _point_struct_key(p) in frontier_keys),
+                ),
+            )
+            chosen.append(last_pt)
+            chosen_keys.add(_point_struct_key(last_pt))
+        selected = chosen
+    f_key = _point_struct_key(fastest)
+    sel_keys = [_point_struct_key(p) for p in selected]
+    if f_key in sel_keys:
+        idx_f = sel_keys.index(f_key)
+        if idx_f > 0:
+            selected[idx_f] = fastest
+    elif selected:
+        selected[-1] = fastest
+    selected.sort(key=lambda p: -p.token_throughput_per_chip)
+    return tuple(selected)
+
+
+def _filter_eligible(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
+    """Return SLO-met points, preferring `estimate_meets` when any exist."""
+    slo_pts = [pt for pt in points if pt.slo_met]
+    est_pts = [pt for pt in slo_pts if pt.slo_verdict == "estimate_meets"]
+    return est_pts if est_pts else slo_pts
+
+
+def _best_by_struct_key(
+    points: Sequence[ParetoPoint],
+) -> dict[
+    tuple[str, tuple[object, ...] | None, tuple[object, ...] | None],
+    ParetoPoint,
+]:
+    """Map each structural layout key to its highest-throughput point."""
     best: dict[
         tuple[str, tuple[object, ...] | None, tuple[object, ...] | None],
         ParetoPoint,
     ] = {}
-    slo_cands = [pt for pt in plan.candidates if pt.slo_met]
-    est_meets = [pt for pt in slo_cands if pt.slo_verdict == "estimate_meets"]
-    eligible = est_meets if est_meets else slo_cands
-    for pt in eligible:
+    for pt in points:
         key = _point_struct_key(pt)
         cur = best.get(key)
         if cur is None or (
@@ -274,22 +429,75 @@ def top_layouts(plan: ServingPlan, k: int = 3) -> tuple[ParetoPoint, ...]:
             cur.est_interactivity_tok_s,
         ):
             best[key] = pt
-    ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
-    if len(ranked) <= 1 or k < MIN_TOP_LAYOUTS_FOR_FASTEST:
-        return tuple(ranked[:k])
-    selected = list(ranked[:k])
+    return best
+
+
+def top_layouts(plan: ServingPlan, k: int = DEFAULT_TOP_K) -> tuple[ParetoPoint, ...]:
+    """Select up to k structurally distinct SLO-met layouts spanning Pareto roles."""
+    if k <= 0:
+        return ()
+    eligible = _filter_eligible(plan.candidates)
+    if not eligible:
+        return ()
+    frontier_eligible = _filter_eligible(plan.frontier)
+    front_best = _best_by_struct_key(frontier_eligible)
+    if len(front_best) >= k:
+        best_map = front_best
+        fastest_pool = frontier_eligible
+    else:
+        best_map = _best_by_struct_key(eligible)
+        # Keep the actual frontier representative for every structural key on frontier.
+        best_map.update(front_best)
+        fastest_pool = eligible
+    front_ranked = sorted(
+        (pt for key, pt in best_map.items() if key in front_best),
+        key=lambda p: -p.token_throughput_per_chip,
+    )
+    cand_ranked = sorted(
+        (pt for key, pt in best_map.items() if key not in front_best),
+        key=lambda p: -p.token_throughput_per_chip,
+    )
+    ranked = [*front_ranked, *cand_ranked]
     fastest = max(
-        eligible,
+        fastest_pool,
         key=lambda p: (p.est_interactivity_tok_s, p.token_throughput_per_chip),
     )
-    f_key = _point_struct_key(fastest)
-    sel_keys = [_point_struct_key(p) for p in selected]
-    if f_key not in sel_keys:
-        selected[-1] = fastest
-    elif sel_keys.index(f_key) > 0:
-        selected[sel_keys.index(f_key)] = fastest
-    selected.sort(key=lambda p: -p.token_throughput_per_chip)
-    return tuple(selected)
+    if k < MIN_DIVERSE_TOP_LAYOUTS:
+        return _select_compact_top_layouts(ranked, fastest, k)
+    return _select_diverse_top_layouts(ranked, fastest, set(front_best), k)
+
+
+def top_layout_roles(
+    top_pts: tuple[ParetoPoint, ...],
+) -> list[tuple[ParetoPoint, str, float]]:
+    """Annotate selected Top-K points with role labels and Rank-1 throughput margins."""
+    top1_tput = top_pts[0].token_throughput_per_chip if top_pts else 0.0
+    fastest_idx = (
+        max(
+            range(len(top_pts)),
+            key=lambda i: (
+                top_pts[i].est_interactivity_tok_s,
+                top_pts[i].token_throughput_per_chip,
+            ),
+        )
+        if len(top_pts) > 1
+        else -1
+    )
+    out: list[tuple[ParetoPoint, str, float]] = []
+    for idx, pt in enumerate(top_pts):
+        role = (
+            "max_throughput"
+            if idx == 0
+            else ("max_interactivity" if idx == fastest_idx else "balanced_knee")
+        )
+        margin = round(
+            PERCENT_SCALE
+            * (pt.token_throughput_per_chip - top1_tput)
+            / max(1e-9, top1_tput),
+            2,
+        )
+        out.append((pt, role, margin))
+    return out
 
 
 def point_launch_args(
@@ -428,7 +636,7 @@ def build_solve_payload(
     chip: ChipSpec,
     dtypes: Dtypes | None = None,
     model: str | None = None,
-    top_k: int = 3,
+    top_k: int = DEFAULT_TOP_K,
 ) -> SolvePayload:
     """Build ``solve/v2`` JSON payload with provenance, chip catalog, and Top-K."""
     kv_str = (
@@ -449,18 +657,6 @@ def build_solve_payload(
     payload["chip_spec"] = chip_dict
     payload["model"] = model
     top_pts = top_layouts(plan, top_k)
-    top1_tput = top_pts[0].token_throughput_per_chip if top_pts else 0.0
-    fastest_idx = (
-        max(
-            range(len(top_pts)),
-            key=lambda i: (
-                top_pts[i].est_interactivity_tok_s,
-                top_pts[i].token_throughput_per_chip,
-            ),
-        )
-        if len(top_pts) > 1
-        else -1
-    )
     eff_spec = (
         plan.spec_tokens if plan.spec_tokens > 0 else (plan.scenario.spec_tokens or 0)
     )
@@ -474,21 +670,12 @@ def build_solve_payload(
     )
     top_entries: list[TopKEntry] = [
         {
-            "frontier_role": (
-                "max_throughput"
-                if idx == 0
-                else ("max_interactivity" if idx == fastest_idx else "balanced_knee")
-            ),
-            "margin_vs_rank1_pct": round(
-                PERCENT_SCALE
-                * (pt.token_throughput_per_chip - top1_tput)
-                / max(1e-9, top1_tput),
-                2,
-            ),
+            "frontier_role": role,
+            "margin_vs_rank1_pct": margin,
             "point": asdict(pt),
             "launch": point_launch_args(pt, opts),
         }
-        for idx, pt in enumerate(top_pts)
+        for pt, role, margin in top_layout_roles(top_pts)
     ]
     payload["top_k"] = top_entries
     return cast("SolvePayload", payload)

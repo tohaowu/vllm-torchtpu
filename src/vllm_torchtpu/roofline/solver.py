@@ -30,6 +30,7 @@ from .constants import (
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     FP8_BYTES,
+    MIN_DISAGG_INSTANCES,
     MIN_MOE_INTERMEDIATE_ALIGNMENT,
     MIN_SLICE_CHIPS,
     UNIT_GIBI,
@@ -155,6 +156,18 @@ EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
         osl=1024,
         concurrencies=(1, 4, 8, 16, 32, 64, 128),
         prefix_hit_rate=0.92,
+        accept_len=3.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+        prefill_chunk=DEFAULT_PREFILL_CHUNK,
+        spec_tokens=3,
+    ),
+    "agentic-64k": TrafficScenario(
+        name="example:agentic-64k",
+        isl=65536,
+        osl=1024,
+        concurrencies=EXAMPLE_CONCURRENCIES,
+        prefix_hit_rate=0.88,
         accept_len=3.0,
         think_time_s=0.0,
         kv_working_set_turns=1.0,
@@ -1688,17 +1701,21 @@ def _search_disagg_instance_ratios(
     eff_max_inst = (
         ctx.max_instances if ctx.max_instances is not None else DEFAULT_MAX_INSTANCES
     )
+    if eff_max_inst < MIN_DISAGG_INSTANCES:
+        return []
+    max_single_pool = eff_max_inst - 1
     if ctx.max_chips is None:
         ratio_xp = math.ceil(rate_d_one / max(1e-9, pref.rate_p)) + 1
         ratio_yd = math.ceil(pref.rate_p / max(1e-9, rate_d_one)) + 1
-        max_xp = min(eff_max_inst, max(1, ratio_xp))
-        max_yd = min(eff_max_inst, max(1, ratio_yd))
+        max_xp = min(max_single_pool, max(1, ratio_xp))
+        max_yd = min(max_single_pool, max(1, ratio_yd))
     else:
-        max_xp = min(eff_max_inst, max(1, ctx.max_chips // pref.topo.num_chips))
-        max_yd = min(eff_max_inst, max(1, ctx.max_chips // dec.topo.num_chips))
+        max_xp = min(max_single_pool, ctx.max_chips // pref.topo.num_chips)
+        max_yd = min(max_single_pool, ctx.max_chips // dec.topo.num_chips)
     points: list[ParetoPoint] = []
     for x_p in range(1, max_xp + 1):
-        for y_d in range(1, max_yd + 1):
+        max_y_for_x = min(max_yd, eff_max_inst - x_p)
+        for y_d in range(1, max_y_for_x + 1):
             total_chips = x_p * pref.topo.num_chips + y_d * dec.topo.num_chips
             if ctx.max_chips is not None and total_chips > ctx.max_chips:
                 continue

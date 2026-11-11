@@ -526,3 +526,153 @@ def test_plan_row_serial_estimate_ms_and_ici_measure_flag() -> None:
     assert rows[0].binding == "ici"
     assert rows[0].flag == "MEASURE"
     assert rows[0].serial_estimate_ms >= rows[0].hard_floor_ms
+
+
+def test_cli_solve_top_k_ascii_table_and_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify --top-k defaults to 5, drives JSON and ASCII tables, and rejects <=0."""
+    expected_default_k = 5
+    expected_k_2 = 2
+    expected_pp_8 = 8
+    expected_err_code = 2
+    cfg_path = tmp_path / "qwen35_fp8.json"
+    raw_text_cfg = QWEN35_CFG["text_config"]
+    assert isinstance(raw_text_cfg, dict)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                **QWEN35_CFG,
+                "text_config": {
+                    **raw_text_cfg,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        )
+    )
+
+    rc_5 = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "64",
+            "--kv-offload-gb",
+            "64",
+            "--json",
+        ]
+    )
+    assert rc_5 == 0
+    payload_5 = json.loads(capsys.readouterr().out)
+    assert len(payload_5["top_k"]) == expected_default_k
+    assert any(
+        (entry["point"].get("prefill_pool") or {}).get("pp") == expected_pp_8
+        for entry in payload_5["top_k"]
+    )
+
+    rc_2_json = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "32",
+            "--top-k",
+            "2",
+            "--json",
+        ]
+    )
+    assert rc_2_json == 0
+    payload_2 = json.loads(capsys.readouterr().out)
+    assert len(payload_2["top_k"]) == expected_k_2
+
+    rc_2_txt = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "32",
+            "--top-k",
+            "2",
+        ]
+    )
+    assert rc_2_txt == 0
+    out_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert "rank" in out_lines[0]
+    assert "role" in out_lines[0]
+    assert len(out_lines) == 1 + expected_k_2
+    assert out_lines[1].split()[0] == "1"
+    assert out_lines[2].split()[0] == "2"
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "solve",
+                "--config",
+                str(cfg_path),
+                "--example-scenario",
+                "coding-agent",
+                "--max-chips",
+                "64",
+                "--top-k",
+                "0",
+            ]
+        )
+    assert excinfo.value.code == expected_err_code
+    _ = capsys.readouterr()
+
+
+def test_cli_solve_rejects_nonpositive_max_instances(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify solve rejects --max-instances <= 0 with parser error exit code."""
+    expected_err_code = 2
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_moe",
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "intermediate_size": 12288,
+                "moe_intermediate_size": 1536,
+                "num_experts": 128,
+                "num_experts_per_tok": 8,
+                "vocab_size": 151936,
+                "dtype": "bfloat16",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "solve",
+                "--config",
+                str(cfg_path),
+                "--chip",
+                "tpu7x",
+                "--example-scenario",
+                "coding-agent",
+                "--max-instances",
+                "0",
+            ]
+        )
+    assert excinfo.value.code == expected_err_code
+    captured = capsys.readouterr()
+    assert "--max-instances" in captured.err

@@ -228,6 +228,8 @@ DEFAULT_MAX_INSTANCES: int = 16
 DEFAULT_HBM_RESERVE_GB: float = 0.0
 DEFAULT_PREFILL_CHUNK: int = 2048
 EP_PAIR_RANKS: int = 2
+MIN_INSTANCES: int = 1
+MIN_DISAGG_INSTANCES: int = 2
 
 EXAMPLE_CONCURRENCIES: tuple[int, ...] = (1, 4, 8, 16, 32, 64, 128, 256)
 EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
@@ -239,9 +241,15 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
+DEFAULT_TOP_K: int = 5
+MIN_TOP_K: int = 1
+MIN_DIVERSE_TOP_LAYOUTS: int = 4
+DEEP_PP_THRESHOLD: int = 8
 
 # Self-contained HTML report constants.
-MAX_EMBEDDED_CANDIDATES: int = 2000
+MAX_EMBEDDED_CANDIDATES: int = 200
+MAX_SVG_BG_POINTS: int = 1200
+SVG_GRID_CELL_PX: float = 4.0
 MIN_FRONTIER_POINTS_FOR_POLYLINE: int = 2
 PREFIX_RANGE_PAIR_LEN: int = 2
 
