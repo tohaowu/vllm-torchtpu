@@ -446,3 +446,4 @@ COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("all-to-all", "all-to-all"),
     ("alltoall", "all-to-all"),
 )
+PUBLIC_MEASUREMENT_ALIASES: frozenset[str] = frozenset({"bundled", "auto"})
