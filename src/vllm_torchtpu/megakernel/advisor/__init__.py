@@ -29,6 +29,7 @@ from . import (
     support,
     verdict,
     vmem,
+    workbench_engine,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
@@ -120,6 +121,7 @@ from .vmem import (
     fit_vmem_budget_bytes,
     validate_advise_inputs,
 )
+from .workbench_engine import render_workbench_engine_js
 
 __all__ = [
     "BUCKET_CONSUMER_STATUS",
@@ -198,6 +200,7 @@ __all__ = [
     "regimes",
     "render_advisor_html",
     "render_regime_dot_plot_svg",
+    "render_workbench_engine_js",
     "report",
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
@@ -213,6 +216,7 @@ __all__ = [
     "verdict",
     "verify_chip_spec_against_jax",
     "vmem",
+    "workbench_engine",
     "write_advisor_html",
     "write_bucket_schedule",
 ]
