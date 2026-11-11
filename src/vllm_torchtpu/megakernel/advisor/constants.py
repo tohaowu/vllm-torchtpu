@@ -461,3 +461,4 @@ PHASE_SORT_ORDER: Mapping[str, int] = {
     "mixed": 2,
     "prefill": 3,
 }
+VALID_MESH_AXIS_VALUES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)

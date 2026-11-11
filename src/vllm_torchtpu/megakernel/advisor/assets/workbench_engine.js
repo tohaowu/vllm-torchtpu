@@ -657,6 +657,7 @@
       return Object.assign({}, full, {
         feasible: calls.every(c => c.feasible),
         reason: (calls.find(c => !c.feasible) || full).reason,
+        nCalls: calls.length,
         ops_per_step: sum('ops_per_step', 0), n_splits: sum('n_splits', 0),
         rawStepUs: fullCalls * full.rawStepUs + (rest ? rest.rawStepUs : 0.0),
         pureStepUs: fullCalls * full.pureStepUs + (rest ? rest.pureStepUs : 0.0),
@@ -890,6 +891,7 @@
         moe_flop_factor: +phi.toFixed(3), w_step_gb: +(wStep / 1e9).toFixed(4),
         w_step_strict_gb: +(wStepStrict / 1e9).toFixed(5),
         act_hbm_mb: +(actBytes / 1e6).toFixed(3),
+        rowsPerCall: sc === 'whole_step' ? singleCallRows : 0,
         compute_us: +(tMatmul * 1e6).toFixed(2),
         chain_us: +(chainS * 1e6).toFixed(2),
         hbm_us: +(tHbm * 1e6).toFixed(2), comm_us: +(commS * 1e6).toFixed(2),

@@ -29,6 +29,7 @@ from . import (
     support,
     verdict,
     vmem,
+    workbench,
     workbench_engine,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
@@ -216,6 +217,7 @@ __all__ = [
     "verdict",
     "verify_chip_spec_against_jax",
     "vmem",
+    "workbench",
     "workbench_engine",
     "write_advisor_html",
     "write_bucket_schedule",
