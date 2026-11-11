@@ -97,7 +97,7 @@ def count_layer_types(geom: ModelGeometry) -> LayerCounts:
         if mapped == "dsa":
             counts["mla"] += 1
             counts["dsa"] += 1
-        elif mapped is not None:
+        elif mapped is not None and mapped != "gqa":
             counts[mapped] += 1
         elif geom.kv_lora_rank > 0:
             counts["mla"] += 1

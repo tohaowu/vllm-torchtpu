@@ -33,9 +33,11 @@ from .constants import (
     UNIT_MILLIS_PER_SECOND,
 )
 from .memory import (
+    HbmBreakdown,
     KvFitInput,
     SeqKvLayout,
     default_rpa_page_size,
+    hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
     kv_capacity_and_hit_rate,
     smem_max_seqs,
@@ -215,6 +217,29 @@ def build_example_scenario(
 
 
 @dataclass(frozen=True)
+class FloorTimes:
+    """Decode-step resource times (ms) behind a point's binding unit."""
+
+    hbm_ms: float
+    matmul_ms: float
+    ici_ms: float
+    chain_ms: float
+    hop_latency_ms: float
+    hard_floor_ms: float
+    binding: str
+
+
+@dataclass(frozen=True)
+class SearchStats:
+    """Search funnel: (layout, concurrency) tuples inside the chip budget."""
+
+    enumerated: int
+    hbm_fit: int
+    slo_met: int
+    frontier: int
+
+
+@dataclass(frozen=True)
 class PoolMeshPlan:
     """Homogeneous instance pool for mixed, prefill-only, or decode-only role."""
 
@@ -231,7 +256,10 @@ class PoolMeshPlan:
     mesh_axes: tuple[int, ...]
     hbm_used_gb: float
     hbm_limit_gb: float
-    moe_dispatch: Literal["allreduce", "ag_ep", "a2a_push", "fused_rs"]
+    moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
+    hbm_weights_gb: float = 0.0
+    hbm_kv_gb: float = 0.0
+    hbm_state_gb: float = 0.0
     max_num_seqs: int | None = None
     max_model_len: int | None = None
 
@@ -253,6 +281,7 @@ class ParetoPoint:
     p_mixed: float
     binding: str
     slo_met: bool
+    decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
 
@@ -270,6 +299,7 @@ class ServingPlan:
     warnings: tuple[str, ...]
     candidates: tuple[ParetoPoint, ...] = ()
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
+    search: SearchStats | None = None
 
 
 @dataclass(frozen=True)
@@ -514,7 +544,7 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     return tuple(frontier)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _SolveContext:
     """Internal solver context capturing model, hardware, and scenario constants."""
 
@@ -536,6 +566,8 @@ class _SolveContext:
     n_chunks: int
     page_size: int
     c_max: int
+    enumerated: int = 0
+    hbm_fit: int = 0
 
 
 @dataclass(frozen=True)
@@ -547,6 +579,7 @@ class _PrefillOption:
     ttft_ms: float
     rate_p: float
     hbm_gb: float
+    hbm_bd: HbmBreakdown
 
 
 @dataclass(frozen=True)
@@ -605,6 +638,22 @@ class _PoolPlanInput:
     hbm_limit_gb: float
     max_num_seqs: int | None
     max_model_len: int
+    hbm_weights_gb: float = 0.0
+    hbm_kv_gb: float = 0.0
+    hbm_state_gb: float = 0.0
+
+
+def _floor_times(sf: StepFloor) -> FloorTimes:
+    """Extract decode-step resource times (ms) from a StepFloor."""
+    return FloorTimes(
+        hbm_ms=sf.hbm_s * UNIT_MILLIS_PER_SECOND,
+        matmul_ms=sf.mm_s * UNIT_MILLIS_PER_SECOND,
+        ici_ms=sf.ici_s * UNIT_MILLIS_PER_SECOND,
+        chain_ms=sf.chain_s * UNIT_MILLIS_PER_SECOND,
+        hop_latency_ms=sf.lat_s * UNIT_MILLIS_PER_SECOND,
+        hard_floor_ms=sf.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+        binding=sf.binding,
+    )
 
 
 def _build_pool_mesh_plan(spec: _PoolPlanInput) -> PoolMeshPlan:
@@ -629,6 +678,9 @@ def _build_pool_mesh_plan(spec: _PoolPlanInput) -> PoolMeshPlan:
         hbm_used_gb=spec.hbm_used_gb,
         hbm_limit_gb=spec.hbm_limit_gb,
         moe_dispatch=spec.par.moe_dispatch,
+        hbm_weights_gb=spec.hbm_weights_gb,
+        hbm_kv_gb=spec.hbm_kv_gb,
+        hbm_state_gb=spec.hbm_state_gb,
         max_num_seqs=spec.max_num_seqs,
         max_model_len=spec.max_model_len,
     )
@@ -686,20 +738,20 @@ def _clamp_resident_batch(
     ctx: _SolveContext,
     par: Parallel,
     b_start: int,
-) -> tuple[int, float] | None:
+) -> tuple[int, HbmBreakdown] | None:
     """Decrease resident batch until HBM usage fits within hbm_limit_b."""
     b_res = b_start
-    hbm_b = hbm_footprint_per_core_bytes(
+    hbm_bd = hbm_breakdown_per_core_bytes(
         ctx.geom, ctx.dtypes, par, SeqKvLayout(b_res, ctx.ctx_full)
     )
-    while b_res > 1 and hbm_b > ctx.hbm_limit_b:
+    while b_res > 1 and hbm_bd.total > ctx.hbm_limit_b:
         b_res -= 1
-        hbm_b = hbm_footprint_per_core_bytes(
+        hbm_bd = hbm_breakdown_per_core_bytes(
             ctx.geom, ctx.dtypes, par, SeqKvLayout(b_res, ctx.ctx_full)
         )
-    if hbm_b > ctx.hbm_limit_b:
+    if hbm_bd.total > ctx.hbm_limit_b:
         return None
-    return b_res, hbm_b
+    return b_res, hbm_bd
 
 
 def _find_prefill_options(
@@ -712,12 +764,13 @@ def _find_prefill_options(
     for topo in topos:
         best_by_class: dict[tuple[int, bool], _PrefillOption] = {}
         for par in _candidate_prefill_parallels(ctx.geom, topo, for_disagg=True):
-            hbm_b = hbm_footprint_per_core_bytes(
+            hbm_bd = hbm_breakdown_per_core_bytes(
                 ctx.geom,
                 ctx.dtypes,
                 par,
                 SeqKvLayout(1, ctx.scenario.isl),
             )
+            hbm_b = hbm_bd.total
             if hbm_b > ctx.hbm_limit_b:
                 continue
             sf_p = _prefill_step_floor(ctx, topo, par, ctx.scenario.prefix_hit_rate)
@@ -737,6 +790,7 @@ def _find_prefill_options(
                     ttft_ms=ttft_ms,
                     rate_p=rate_p,
                     hbm_gb=hbm_b / UNIT_GIGA,
+                    hbm_bd=hbm_bd,
                 )
         prefill_options.extend(best_by_class.values())
     return prefill_options, min_req_ttft_ms
@@ -762,6 +816,25 @@ def _solve_mixed_think_batch(
     return b_local
 
 
+def _fit_mixed_resident_batch(
+    ctx: _SolveContext,
+    topo: SliceTopology,
+    par: Parallel,
+    c: int,
+    bounds: _MixedPointBounds,
+) -> tuple[int, int, HbmBreakdown] | None:
+    """Compute active local batch and HBM-fitting resident batch."""
+    b_local = _solve_mixed_think_batch(ctx, topo, par, c, bounds.sf_ttft)
+    b_start = min(b_local, bounds.b_hbm_max, bounds.b_smem_max)
+    if ctx.scenario.max_num_seqs is not None:
+        b_start = min(b_start, ctx.scenario.max_num_seqs)
+    clamped = _clamp_resident_batch(ctx, par, b_start)
+    if clamped is None:
+        return None
+    b_res, hbm_bd = clamped
+    return b_local, b_res, hbm_bd
+
+
 def _evaluate_mixed_point(
     ctx: _SolveContext,
     topo: SliceTopology,
@@ -776,14 +849,12 @@ def _evaluate_mixed_point(
     offload_b_per_core = (
         float(ctx.scenario.kv_offload_gb) * UNIT_GIGA / float(max(1, topo.num_cores))
     )
-    b_local = _solve_mixed_think_batch(ctx, topo, par, c, bounds.sf_ttft)
-    b_start = min(b_local, bounds.b_hbm_max, bounds.b_smem_max)
-    if ctx.scenario.max_num_seqs is not None:
-        b_start = min(b_start, ctx.scenario.max_num_seqs)
-    clamped = _clamp_resident_batch(ctx, par, b_start)
-    if clamped is None:
+    fitted = _fit_mixed_resident_batch(ctx, topo, par, c, bounds)
+    if fitted is None:
         return None
-    b_res, hbm_b = clamped
+    b_local, b_res, hbm_bd = fitted
+    hbm_b = hbm_bd.total
+    ctx.hbm_fit += 1
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         ctx.geom,
         ctx.dtypes,
@@ -889,6 +960,9 @@ def _evaluate_mixed_point(
             hbm_limit_gb=ctx.hbm_limit_gb,
             max_num_seqs=max_seqs_flag,
             max_model_len=ctx.ctx_full,
+            hbm_weights_gb=hbm_bd.weights / UNIT_GIGA,
+            hbm_kv_gb=hbm_bd.kv / UNIT_GIGA,
+            hbm_state_gb=hbm_bd.state / UNIT_GIGA,
         )
     )
     binding = (
@@ -908,6 +982,7 @@ def _evaluate_mixed_point(
         p_mixed=p_mix,
         binding=binding,
         slo_met=slo_ok,
+        decode_floor=_floor_times(sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -970,6 +1045,7 @@ def _evaluate_mixed_candidates(
                 sf_ttft=sf_ttft,
             )
             for c in ctx.scenario.concurrencies:
+                ctx.enumerated += 1
                 pt = _evaluate_mixed_point(ctx, topo, par, c, bounds)
                 if pt is not None:
                     candidates.append(pt)
@@ -1086,7 +1162,9 @@ def _evaluate_disagg_instance_pair(
     clamped = _clamp_resident_batch(ctx, dec.par, b_start)
     if clamped is None:
         return None
-    b_res, hbm_d = clamped
+    b_res, hbm_bd_d = clamped
+    hbm_d = hbm_bd_d.total
+    ctx.hbm_fit += 1
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         ctx.geom,
         ctx.dtypes,
@@ -1129,6 +1207,9 @@ def _evaluate_disagg_instance_pair(
             hbm_limit_gb=ctx.hbm_limit_gb,
             max_num_seqs=None,
             max_model_len=ctx.ctx_full,
+            hbm_weights_gb=pref.hbm_bd.weights / UNIT_GIGA,
+            hbm_kv_gb=pref.hbm_bd.kv / UNIT_GIGA,
+            hbm_state_gb=pref.hbm_bd.state / UNIT_GIGA,
         )
     )
     d_pool = _build_pool_mesh_plan(
@@ -1141,6 +1222,9 @@ def _evaluate_disagg_instance_pair(
             hbm_limit_gb=ctx.hbm_limit_gb,
             max_num_seqs=max_seqs_d,
             max_model_len=ctx.ctx_full,
+            hbm_weights_gb=hbm_bd_d.weights / UNIT_GIGA,
+            hbm_kv_gb=hbm_bd_d.kv / UNIT_GIGA,
+            hbm_state_gb=hbm_bd_d.state / UNIT_GIGA,
         )
     )
     return ParetoPoint(
@@ -1157,6 +1241,7 @@ def _evaluate_disagg_instance_pair(
         p_mixed=0.0,
         binding=sf_d.binding,
         slo_met=slo_ok,
+        decode_floor=_floor_times(sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -1189,6 +1274,9 @@ def _search_disagg_instance_ratios(
     for x_p in range(1, max_xp + 1):
         for y_d in range(1, max_yd + 1):
             total_chips = x_p * pref.topo.num_chips + y_d * dec.topo.num_chips
+            if ctx.max_chips is not None and total_chips > ctx.max_chips:
+                continue
+            ctx.enumerated += 1
             pt = _evaluate_disagg_instance_pair(
                 ctx,
                 dec,
@@ -1360,4 +1448,10 @@ def solve_serving_plan(
         warnings=tuple(warnings),
         candidates=tuple(pool_for_frontier),
         gpu_memory_utilization=opts.gpu_memory_utilization,
+        search=SearchStats(
+            enumerated=ctx.enumerated,
+            hbm_fit=ctx.hbm_fit,
+            slo_met=len(slo_candidates),
+            frontier=len(frontier),
+        ),
     )

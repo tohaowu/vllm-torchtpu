@@ -205,3 +205,7 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
     "interactive": (5000.0, 33.33),
     "throughput": (5000.0, 66.67),
 }
+
+# Versioned solve JSON payload and top-K diversity selection constants.
+SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v1"
+MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
