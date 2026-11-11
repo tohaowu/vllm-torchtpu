@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Literal
 from .constants import (
     AR_PHASES,
     DEFAULT_CORES_PER_CHIP,
+    MIN_TORUS_DIM,
     WRAPPED_LANES_PER_AXIS,
 )
 
@@ -190,7 +191,11 @@ def torus_collective_s(
     # Google Cloud TPU7x doc (https://cloud.google.com/tpu/docs/tpu7x):
     # D2D interconnect is six times faster than one ICI link (600 GB/s per chip).
     if ax * ay * az == 1:
-        intra_bw = chip.ici_bw * chip.cores_per_chip
+        intra_bw = (
+            chip.d2d_bw
+            if (math.isfinite(chip.d2d_bw) and chip.d2d_bw > 0.0)
+            else chip.ici_bw * chip.cores_per_chip
+        )
         xfer = (
             payload_bytes
             if kind in ("push", "p2p")
@@ -236,3 +241,58 @@ def torus_collective_s(
     xfer = payload_bytes if kind == "push" else payload_bytes * (group - 1) / group
     phase_s = lat_1p + xfer / eff_bw
     return float(AR_PHASES) * phase_s if kind == "ar" else phase_s
+
+
+def _count_cut_links(
+    axes: tuple[int, int, int],
+    topology: SliceTopology | None,
+) -> int:
+    """Count unidirectional ICI cut links per direction across active mesh axes."""
+    links_in = 0
+    for axis_idx, ext in enumerate(axes):
+        if ext <= 1:
+            continue
+        if (
+            ext >= MIN_TORUS_DIM
+            and topology is not None
+            and topology.axis_wrapped(axis_idx, ext)
+        ):
+            links_in += WRAPPED_LANES_PER_AXIS
+        else:
+            links_in += 1
+    return max(1, links_in)
+
+
+def collective_cut_bound_s(
+    kind: Kind,
+    payload_bytes: float,
+    submesh_axes: tuple[int, int, int, int],
+    chip: ChipSpec,
+    topology: SliceTopology | None = None,
+) -> float:
+    """Physical cut-set lower bound in seconds for one collective."""
+    d2d, ax, ay, az = submesh_axes
+    g = d2d * ax * ay * az
+    if g <= 1 or payload_bytes <= 0.0 or not _has_finite_ici(chip):
+        return 0.0
+    if ax * ay * az == 1:
+        intra_bw = (
+            chip.d2d_bw
+            if (math.isfinite(chip.d2d_bw) and chip.d2d_bw > 0.0)
+            else chip.ici_bw * float(chip.cores_per_chip)
+        )
+        cut_bytes = (
+            payload_bytes * float(g - 1) / float(g)
+            if kind in ("ag", "rs")
+            else payload_bytes
+        )
+        return cut_bytes / intra_bw
+    r = max(1, min(g, d2d))
+    if kind in ("ag", "rs"):
+        # AG imports (g - r) / g across the cut; RS exports (g - r) / g
+        # symmetrically across the same cut (max with local shard r / g).
+        cut_bytes = payload_bytes * float(max(g - r, r)) / float(g)
+    else:
+        cut_bytes = payload_bytes
+    cut_links = _count_cut_links((ax, ay, az), topology)
+    return cut_bytes / (float(cut_links) * chip.ici_link_bw)

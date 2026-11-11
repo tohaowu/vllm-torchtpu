@@ -22,17 +22,13 @@ from typing import TYPE_CHECKING
 from .constants import (
     BYTES_PER_PAGE_ENTRY,
     GLU_MATMUL_COUNT,
-    HBM_MIN_PACKING_DIVISOR,
-    HBM_PACKING_NUMERATOR,
-    HEAD_DIM_PACKING_THRESHOLD,
     LAYER_TYPE_MAP,
     MAX_CTX_TOKENS_FOR_SMALL_PAGE,
     PAGE_TABLE_BYTE_BUDGET,
-    PHYSICAL_ALIGNMENT_ELEMS,
     RPA_MAX_PAGE_TOKENS,
     RPA_MIN_PAGE_TOKENS,
-    SPARSE_MLA_SCALE_BYTES,
 )
+from .modules import kv_bytes_per_token_per_layer
 
 if TYPE_CHECKING:
     from .geometry import ModelGeometry
@@ -334,27 +330,6 @@ def _compute_w_mtp(
     return float(geom.mtp_layers) * (mtp_fc + mtp_att + mtp_ffn) / float(pp)
 
 
-def _gqa_kv_bytes_per_tok(
-    head_dim: int,
-    kvh: int,
-    kv_packing: int,
-    kv_bytes: float,
-    *,
-    physical_kv_layout: bool,
-) -> float:
-    """Compute KV bytes per token for one GQA/SWA attention head geometry."""
-    if not physical_kv_layout:
-        return float(2 * kvh * head_dim) * kv_bytes
-    padded_hd = (
-        math.ceil(head_dim / PHYSICAL_ALIGNMENT_ELEMS) * PHYSICAL_ALIGNMENT_ELEMS
-        if head_dim > 0
-        else 0
-    )
-    kx2 = kvh if head_dim == HEAD_DIM_PACKING_THRESHOLD else 2 * kvh
-    padded_kx2 = math.ceil(kx2 / kv_packing) * kv_packing if kx2 > 0 else 0
-    return float(padded_kx2 * padded_hd) * kv_bytes
-
-
 def _compute_kv_and_state(
     geom: ModelGeometry,
     dt: Dtypes,
@@ -365,7 +340,6 @@ def _compute_kv_and_state(
     """Compute (kv_bytes, state_bytes) active on one core."""
     tp = max(1, par.tp)
     pp = max(1, par.pp)
-    kvh = max(1, geom.num_kv_heads // tp) if geom.num_kv_heads > 0 else 0
     if counts.mla > 0:
         if geom.kv_lora_rank <= 0:
             msg = "MLA layer requires config field 'kv_lora_rank'"
@@ -373,41 +347,16 @@ def _compute_kv_and_state(
         if geom.qk_rope_head_dim < 0:
             msg = "MLA layer requires config field 'qk_rope_head_dim'"
             raise ValueError(msg)
-    raw_latent_w = geom.kv_lora_rank + geom.qk_rope_head_dim
-    gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
-    swa_hd = geom.head_dim
-    kv_packing = (
-        max(1, round(HBM_PACKING_NUMERATOR / max(HBM_MIN_PACKING_DIVISOR, dt.kv)))
-        if layout.physical_kv_layout
-        else 1
+    gqa_kv_b_per_tok = kv_bytes_per_token_per_layer(
+        geom, dt, par, "gqa", physical=layout.physical_kv_layout
     )
-    gqa_kv_b_per_tok = _gqa_kv_bytes_per_tok(
-        gqa_hd, kvh, kv_packing, dt.kv, physical_kv_layout=layout.physical_kv_layout
+    swa_kv_b_per_tok = kv_bytes_per_token_per_layer(
+        geom, dt, par, "swa", physical=layout.physical_kv_layout
     )
-    swa_kv_b_per_tok = _gqa_kv_bytes_per_tok(
-        swa_hd, kvh, kv_packing, dt.kv, physical_kv_layout=layout.physical_kv_layout
+    mla_kind = "dsa" if geom.index_topk > 0 else "mla"
+    mla_kv_b_per_tok = kv_bytes_per_token_per_layer(
+        geom, dt, par, mla_kind, physical=layout.physical_kv_layout
     )
-    if layout.physical_kv_layout:
-        mla_latent_b = (
-            float(
-                math.ceil(raw_latent_w / PHYSICAL_ALIGNMENT_ELEMS)
-                * PHYSICAL_ALIGNMENT_ELEMS
-            )
-            * dt.kv
-        )
-        dsa_idx_b = (
-            float(geom.index_head_dim) * dt.kv
-            + (SPARSE_MLA_SCALE_BYTES if dt.kv <= 1.0 else 0.0)
-            if (geom.index_topk > 0 and geom.index_head_dim > 0)
-            else 0.0
-        )
-    else:
-        mla_latent_b = float(raw_latent_w) * dt.kv
-        dsa_idx_b = (
-            float(geom.index_head_dim) * dt.kv
-            if (geom.index_topk > 0 and geom.index_head_dim > 0)
-            else 0.0
-        )
     kv_div = par.kv_split * par.pcp * pp
     kv_gqa = (
         float(layout.seqs_per_dp * layout.context) * counts.eff_gqa * gqa_kv_b_per_tok
@@ -419,9 +368,7 @@ def _compute_kv_and_state(
     )
     kv_swa = float(layout.seqs_per_dp * eff_swa_ctx) * counts.eff_swa * swa_kv_b_per_tok
     kv_mla = (
-        float(layout.seqs_per_dp * layout.context)
-        * counts.eff_mla
-        * (mla_latent_b + dsa_idx_b)
+        float(layout.seqs_per_dp * layout.context) * counts.eff_mla * mla_kv_b_per_tok
     )
     kv_bytes = (kv_gqa + kv_swa + kv_mla) / kv_div
 

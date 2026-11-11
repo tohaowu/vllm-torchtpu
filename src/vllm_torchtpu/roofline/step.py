@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from .collectives import (
     CollectiveConfig,
+    collective_cut_bound_s,
     collective_ici_hops,
     make,
     submesh_for_group,
@@ -70,7 +71,7 @@ class SpecShape:
 
 @dataclass(frozen=True)
 class StepFloor:
-    """Resource times and binding bottleneck for one step or speculative cycle."""
+    """Resource times, physical lower bound, and serial estimate for one step."""
 
     modules: tuple[ModuleCost, ...]
     hbm_s: float
@@ -78,19 +79,28 @@ class StepFloor:
     ici_s: float
     chain_s: float
     hard_floor_s: float
-    serial_floor_s: float
+    serial_estimate_s: float
     binding: str
     lat_s: float = 0.0
+    hbm_bound_s: float = 0.0
+    mm_bound_s: float = 0.0
+    coll_bound_s: float = 0.0
+    latency_assumed_s: float = 0.0
+
+    @property
+    def serial_floor_s(self) -> float:
+        """Backward-compatible alias removed once solver updates in Commit 8b."""
+        return self.serial_estimate_s
 
     @property
     def resource_bound_s(self) -> float:
-        """Maximum time across HBM, matmul, and ICI resource bounds."""
-        return max(self.hbm_s, self.mm_s, self.ici_s)
+        """Maximum time across HBM, matmul, and collective cut bounds."""
+        return max(self.hbm_bound_s, self.mm_bound_s, self.coll_bound_s)
 
     @property
     def latency_bound_s(self) -> float:
-        """Hops-derived network latency floor in seconds."""
-        return self.lat_s
+        """Assumed hop-derived network latency in seconds (reported beside bound)."""
+        return self.latency_assumed_s
 
 
 @lru_cache(maxsize=UNIT_COLL_CACHE_MAXSIZE)
@@ -100,8 +110,8 @@ def _unit_coll_times(
     ranks_per_chip: int,
     c_axes: tuple[int, int, int, int] | None,
     chip: ChipSpec,
-) -> tuple[float, float]:
-    """Compute per-hop latency and analytic collective duration for one collective."""
+) -> tuple[float, float, float]:
+    """Compute assumed hop latency, analytic duration, and cut bound."""
     has_finite_ici = chip.ici_bw > 0.0 and math.isfinite(chip.ici_bw)
     unit_hop_lat_s = (
         chip.ici_hop_latency_s
@@ -115,8 +125,9 @@ def _unit_coll_times(
     c_hops = collective_ici_hops(c, topology, ranks_per_chip, c_axes)
     hop_s = c_hops * unit_hop_lat_s
     submesh = submesh_for_group(c.group, topology, ranks_per_chip, c_axes)
+    cut_s = collective_cut_bound_s(c.kind, c.payload, submesh, chip, topology)
     anal_s = torus_collective_s(c.kind, c.payload, submesh, chip, topology)
-    return (hop_s, anal_s)
+    return (hop_s, anal_s, cut_s)
 
 
 def _dedup_module_collectives(
@@ -150,6 +161,44 @@ def _dedup_module_collectives(
     return coll_counts, coll_samples
 
 
+def _sum_module_resources(
+    modules: tuple[ModuleCost, ...],
+    chip: ChipSpec,
+    *,
+    has_finite_ici: bool,
+) -> tuple[float, float, float, float, float, float]:
+    """Sum per-module HBM, FLOPs, ICI, and serial module execution times."""
+    tot_hbm_b = 0.0
+    tot_hbm_min_b = 0.0
+    tot_fp8 = 0.0
+    tot_bf16 = 0.0
+    tot_fp8_min = 0.0
+    tot_bf16_min = 0.0
+    tot_ici_b = 0.0
+    mod_serial_s = 0.0
+    for m in modules:
+        hb = m.hbm_bytes
+        f8 = m.fp8_flops
+        b16 = m.bf16_flops
+        tot_hbm_b += hb
+        tot_hbm_min_b += m.strict_hbm_bytes
+        tot_fp8 += f8
+        tot_bf16 += b16
+        tot_fp8_min += m.strict_fp8_flops
+        tot_bf16_min += m.strict_bf16_flops
+        if has_finite_ici:
+            tot_ici_b += m.ici_bytes
+        mod_serial_s += max(
+            hb / chip.hbm_bw, f8 / chip.fp8_flops + b16 / chip.bf16_flops
+        )
+    hbm_s = tot_hbm_b / chip.hbm_bw
+    mm_s = tot_fp8 / chip.fp8_flops + tot_bf16 / chip.bf16_flops
+    ici_s = tot_ici_b / chip.ici_bw if has_finite_ici else 0.0
+    hbm_bound_s = tot_hbm_min_b / chip.hbm_bw
+    mm_bound_s = tot_fp8_min / chip.fp8_flops + tot_bf16_min / chip.bf16_flops
+    return (hbm_s, mm_s, ici_s, hbm_bound_s, mm_bound_s, mod_serial_s)
+
+
 def _combine_modules(
     modules: tuple[ModuleCost, ...],
     chip: ChipSpec,
@@ -160,26 +209,9 @@ def _combine_modules(
 ) -> StepFloor:
     """Combine per-module resource costs into a StepFloor summary."""
     has_finite_ici = chip.ici_bw > 0.0 and math.isfinite(chip.ici_bw)
-    tot_hbm_b = 0.0
-    tot_fp8 = 0.0
-    tot_bf16 = 0.0
-    tot_ici_b = 0.0
-    mod_serial_s = 0.0
-    for m in modules:
-        hb = m.hbm_bytes
-        f8 = m.fp8_flops
-        b16 = m.bf16_flops
-        tot_hbm_b += hb
-        tot_fp8 += f8
-        tot_bf16 += b16
-        if has_finite_ici:
-            tot_ici_b += m.ici_bytes
-        mod_serial_s += max(
-            hb / chip.hbm_bw, f8 / chip.fp8_flops + b16 / chip.bf16_flops
-        )
-    hbm_s = tot_hbm_b / chip.hbm_bw
-    mm_s = tot_fp8 / chip.fp8_flops + tot_bf16 / chip.bf16_flops
-    ici_s = tot_ici_b / chip.ici_bw if has_finite_ici else 0.0
+    hbm_s, mm_s, ici_s, hbm_bound_s, mm_bound_s, mod_serial_s = _sum_module_resources(
+        modules, chip, has_finite_ici=has_finite_ici
+    )
     mesh_axes = par.mesh_axes if par is not None else None
     ranks_per_chip = par.ranks_per_chip if par is not None else chip.cores_per_chip
     use_torus = topology is not None or mesh_axes is not None
@@ -187,26 +219,28 @@ def _combine_modules(
     coll_counts, coll_samples = _dedup_module_collectives(modules)
     hop_lat_s = 0.0
     analytic_chain_s = 0.0
+    coll_bound_s = 0.0
     user_chain_lat_s = 0.0
     for ckey, c in coll_samples:
         cnt = coll_counts[ckey]
         c_axes = mesh_axes if (par is not None and c.group == par.tp) else None
-        hop_s, anal_s = _unit_coll_times(c, topology, ranks_per_chip, c_axes, chip)
+        hop_s, anal_s, cut_s = _unit_coll_times(
+            c, topology, ranks_per_chip, c_axes, chip
+        )
         hop_lat_s += cnt * hop_s
         analytic_chain_s += cnt * anal_s
+        coll_bound_s += cnt * cut_s
         if collective_latency_s > 0.0:
             user_chain_lat_s += cnt * (c.hops * collective_latency_s)
     chain_s = analytic_chain_s + user_chain_lat_s
 
-    resource_bound_s = max(hbm_s, mm_s, ici_s)
-    latency_bound_s = hop_lat_s
-    hard_floor_s = max(resource_bound_s, latency_bound_s, analytic_chain_s)
-    serial_floor_s = mod_serial_s + chain_s
-    if hard_floor_s == hbm_s:
+    hard_floor_s = max(hbm_bound_s, mm_bound_s, coll_bound_s)
+    serial_estimate_s = mod_serial_s + chain_s
+    if hard_floor_s == hbm_bound_s:
         binding = "hbm"
-    elif hard_floor_s == mm_s:
+    elif hard_floor_s == mm_bound_s:
         binding = "matmul"
-    elif hard_floor_s > ici_s or use_torus or hop_lat_s > ici_s:
+    elif use_torus:
         binding = "chain"
     else:
         binding = "ici"
@@ -217,9 +251,13 @@ def _combine_modules(
         ici_s=ici_s,
         chain_s=chain_s,
         hard_floor_s=hard_floor_s,
-        serial_floor_s=serial_floor_s,
+        serial_estimate_s=serial_estimate_s,
         binding=binding,
         lat_s=hop_lat_s,
+        hbm_bound_s=hbm_bound_s,
+        mm_bound_s=mm_bound_s,
+        coll_bound_s=coll_bound_s,
+        latency_assumed_s=hop_lat_s,
     )
 
 
@@ -354,6 +392,12 @@ def spec_cycle_floor(
                 None
                 if m.unique_collectives is None
                 else tuple((c, cnt * spec.k) for c, cnt in m.unique_collectives)
+            ),
+            fp8_flops_min=(
+                None if m.fp8_flops_min is None else m.fp8_flops_min * spec.k
+            ),
+            bf16_flops_min=(
+                None if m.bf16_flops_min is None else m.bf16_flops_min * spec.k
             ),
         )
         for m in one_draft

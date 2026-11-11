@@ -27,7 +27,13 @@ from vllm_torchtpu.roofline import (
     from_hf_config,
     pass_costs,
 )
-from vllm_torchtpu.roofline.modules import ep_busiest_experts, experts_touched
+from vllm_torchtpu.roofline.geometry import layer_ffn_kinds
+from vllm_torchtpu.roofline.memory import compute_w_ffn
+from vllm_torchtpu.roofline.modules import (
+    ep_busiest_experts,
+    experts_touched,
+    kv_bytes_per_token_per_layer,
+)
 
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
@@ -249,7 +255,12 @@ def test_stock_plan_ep_fp8kv_batch1_bytes() -> None:
     )
     by_name = {m.name: m for m in mods}
     assert by_name["moe"].hbm_bytes == pytest.approx(2_595_776_984.77, abs=1.0)
-    assert sum(m.hbm_bytes for m in mods) == pytest.approx(4_476_803_544.77, abs=1.0)
+    assert sum(m.hbm_bytes for m in mods) == pytest.approx(5_168_280_024.77, abs=1.0)
+    assert by_name["gqa"].hbm_bytes_min is not None
+    logical_hbm = sum(m.hbm_bytes for m in mods) - (
+        by_name["gqa"].hbm_bytes - by_name["gqa"].hbm_bytes_min
+    )
+    assert logical_hbm == pytest.approx(4_476_803_544.77, abs=1.0)
 
 
 def test_sequence_parallel_replicates_shared_expert() -> None:
@@ -279,7 +290,10 @@ def test_library_defaults_batch1_bytes() -> None:
         StepShape(batch=1, rows_per_seq=1, context=90036),
         Dtypes(state=2.0),
     )
-    assert sum(m.hbm_bytes for m in mods) == pytest.approx(2_628_574_720.0, abs=1.0)
+    assert sum(m.hbm_bytes for m in mods) == pytest.approx(2_801_443_840.0, abs=1.0)
+    assert sum(m.strict_hbm_bytes for m in mods) == pytest.approx(
+        2_628_574_720.0, abs=1.0
+    )
 
 
 def test_ar_algorithm_wire_and_hops() -> None:
@@ -410,7 +424,9 @@ def test_uneven_pp8_and_gdn_recurrence_flops() -> None:
         )
     }
     kv_only_b = m_dcp1["gqa"].hbm_bytes - m_dcp1_ctx0["gqa"].hbm_bytes
-    assert kv_only_b == pytest.approx(15.0 * 8192.0 * 512.0, abs=1.0)
+    assert kv_only_b == pytest.approx(15.0 * 8192.0 * 1024.0, abs=1.0)
+    kv_only_min_b = m_dcp1["gqa"].strict_hbm_bytes - m_dcp1_ctx0["gqa"].strict_hbm_bytes
+    assert kv_only_min_b == pytest.approx(15.0 * 8192.0 * 512.0, abs=1.0)
     assert m_dcp1_ctx0["gdn"].bf16_flops > 45.0 * 4.0 * 8.0 * 128.0 * 128.0
 
     m_pp8 = {
@@ -703,3 +719,110 @@ def test_block_parallel_sp_collectives_per_moe_dispatch() -> None:
     moe_ag = next(m for m in costs_ag if m.name == "moe")
     assert "out_rs" in {c.name for c in attn_ag.collectives}
     assert "dispatch_ag" in {c.name for c in moe_ag.collectives}
+
+
+def test_step_ffn_layers_match_capacity_ffn_layers() -> None:
+    """Verify pass_costs FFN accounting agrees with compute_w_ffn across hybrids."""
+    llama4_cfg: dict[str, object] = {
+        "model_type": "llama4_text",
+        "hidden_size": 5120,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "intermediate_size": 8192,
+        "moe_intermediate_size": 8192,
+        "num_local_experts": 16,
+        "num_experts_per_tok": 1,
+        "interleave_moe_layer_step": 2,
+        "vocab_size": 202048,
+    }
+    nemotron_cfg: dict[str, object] = {
+        "model_type": "nemotron_h",
+        "hidden_size": 4096,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "conv_kernel": 4,
+        "hybrid_override_pattern": "M-M*ME",
+        "n_routed_experts": 16,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 2048,
+        "intermediate_size": 8192,
+        "vocab_size": 131072,
+    }
+    dt = Dtypes()
+    par = Parallel(tp=1)
+    shape = StepShape(batch=4096, rows_per_seq=1, context=16)
+
+    expected_three = 3
+    geom_l4 = from_hf_config(llama4_cfg)
+    assert layer_ffn_kinds(geom_l4).count("dense") == expected_three
+    assert layer_ffn_kinds(geom_l4).count("moe") == expected_three
+    assert geom_l4.ffn_layer_counts() == (expected_three, expected_three)
+    mods_l4 = pass_costs(geom_l4, par, shape, dt)
+    step_ffn_l4 = sum(m.hbm_bytes for m in mods_l4 if m.name in ("mlp", "moe"))
+    w_ffn_l4, _ = compute_w_ffn(geom_l4, dt, par)
+    assert step_ffn_l4 == pytest.approx(w_ffn_l4, abs=1.0)
+    assert step_ffn_l4 == pytest.approx(6_417_776_640.0, abs=1.0)
+
+    geom_nh = from_hf_config(nemotron_cfg)
+    expected_four = 4
+    assert layer_ffn_kinds(geom_nh).count("dense") == 1
+    assert layer_ffn_kinds(geom_nh).count("moe") == 1
+    assert layer_ffn_kinds(geom_nh).count("none") == expected_four
+    assert geom_nh.ffn_layer_counts() == (1, 1)
+    mods_nh = pass_costs(geom_nh, par, shape, dt)
+    step_ffn_nh = sum(m.hbm_bytes for m in mods_nh if m.name in ("mlp", "moe"))
+    w_ffn_nh, _ = compute_w_ffn(geom_nh, dt, par)
+    assert step_ffn_nh == pytest.approx(w_ffn_nh, abs=1.0)
+    assert step_ffn_nh == pytest.approx(503_447_552.0, abs=1.0)
+
+
+def test_kv_bytes_single_source_physical_and_logical() -> None:
+    """Verify kv_bytes_per_token_per_layer physical padding and unpadded bounds."""
+    geom = from_hf_config(QWEN35_CFG)
+    par = Parallel(tp=8)
+    dt = Dtypes(kv=1.0)
+    expected_phys = 1024.0
+    expected_min = 512.0
+    assert kv_bytes_per_token_per_layer(geom, dt, par, "gqa", physical=True) == (
+        pytest.approx(expected_phys)
+    )
+    assert kv_bytes_per_token_per_layer(geom, dt, par, "gqa", physical=False) == (
+        pytest.approx(expected_min)
+    )
+    fam_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 4,
+        "layer_types": ["gqa", "swa", "mla", "dsa"],
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 64,
+        "sliding_window": 256,
+        "q_lora_rank": 512,
+        "kv_lora_rank": 300,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "index_n_heads": 8,
+        "index_head_dim": 64,
+        "index_topk": 256,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+    }
+    fam_geom = from_hf_config(fam_cfg)
+    mods = {
+        m.name: m
+        for m in pass_costs(
+            fam_geom,
+            Parallel(tp=8),
+            StepShape(batch=2, rows_per_seq=1, context=1024),
+            Dtypes(kv=1.0),
+        )
+    }
+    for fam in ("gqa", "swa", "mla", "dsa"):
+        assert mods[fam].hbm_bytes_min is not None
+        assert mods[fam].hbm_bytes > mods[fam].hbm_bytes_min

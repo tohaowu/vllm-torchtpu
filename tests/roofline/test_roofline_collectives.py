@@ -21,6 +21,7 @@ from dataclasses import replace
 import pytest
 
 from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, torus_collective_s
+from vllm_torchtpu.roofline import collectives as rf_collectives
 from vllm_torchtpu.roofline.collectives import CollectiveConfig, make, submesh_for_group
 
 
@@ -47,7 +48,7 @@ def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     assert "contraction_floor_s" not in dir(chip)
     assert "d2d_latency_s" not in dir(chip)
     assert "usable_hbm_frac" not in dir(chip)
-    assert "d2d_bw" not in dir(chip)
+    assert chip.d2d_bw == pytest.approx(expected_ici_bw * chip.cores_per_chip)
     assert chip.ici_link_bw == expected_link_bw
     assert chip.ici_bw == expected_ici_bw
     assert chip.ici_hop_latency_s == expected_hop_latency
@@ -84,6 +85,48 @@ def test_torus_collective_adds_hop_latency_to_bandwidth_phase() -> None:
         torus_collective_s("ar", 1024.0, (2, 1, 1, 1), replace(chip, ici_bw=-1.0))
         == 0.0
     )
+    high_ici = replace(chip, ici_bw=500.0e9)
+    assert rf_collectives.collective_cut_bound_s(
+        "ar", 1024.0, (2, 1, 1, 1), high_ici
+    ) <= torus_collective_s("ar", 1024.0, (2, 1, 1, 1), high_ici)
+
+
+def test_collective_bound_at_or_below_feasible_schedule() -> None:
+    """Verify 2x2x1 collective cut bound stays below feasible schedules."""
+    payload_bytes = 64.0 * 1024.0 * 1024.0
+    chip = CHIPS["tpu7x"]
+    topo = TOPOLOGIES["2x2x1"]
+    submesh = submesh_for_group(8, topo, 2)
+    feasible_s = (
+        payload_bytes / chip.d2d_bw
+        + payload_bytes / chip.ici_link_bw
+        + payload_bytes / chip.d2d_bw
+    )
+    cut_s = payload_bytes / (2.0 * chip.ici_link_bw)
+    bound_s = rf_collectives.collective_cut_bound_s(
+        "ar", payload_bytes, submesh, chip, topo
+    )
+    est_s = torus_collective_s("ar", payload_bytes, submesh, chip, topo)
+    assert bound_s == pytest.approx(0.00033554432, rel=1e-12)
+    assert bound_s == pytest.approx(cut_s, rel=1e-12)
+    assert bound_s <= feasible_s
+    assert feasible_s <= est_s
+
+
+def test_collective_cut_bound_rs_symmetric_with_ag() -> None:
+    """Verify Reduce-Scatter cut bound matches All-Gather cut traffic on multichip."""
+    payload_bytes = 64.0 * 1024.0 * 1024.0
+    chip = CHIPS["tpu7x"]
+    topo = TOPOLOGIES["2x2x1"]
+    submesh = (2, 2, 2, 1)
+    ag_s = rf_collectives.collective_cut_bound_s(
+        "ag", payload_bytes, submesh, chip, topo
+    )
+    rs_s = rf_collectives.collective_cut_bound_s(
+        "rs", payload_bytes, submesh, chip, topo
+    )
+    assert rs_s == pytest.approx(ag_s, rel=1e-12)
+    assert rs_s == pytest.approx((payload_bytes * 6.0 / 8.0) / (2.0 * 100.0e9))
 
 
 def test_collective_make_uses_typed_config() -> None:

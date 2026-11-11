@@ -374,7 +374,7 @@ def _dispatch_plan(
         return 0
     hdr = (
         f"{'c':>4}  {'rows':>6}  {'binding':<7}  "
-        f"{'hard_floor_ms':>13}  {'serial_floor_ms':>15}  "
+        f"{'hard_floor_ms':>13}  {'serial_estimate_ms':>18}  "
         f"{'tpot_floor_ms':>13}  {'interactivity_ceil_tok_s':>24}  "
         f"{'output_tput_ceil_per_chip':>25}  {'flag':<7}\n"
     )
@@ -382,7 +382,7 @@ def _dispatch_plan(
     for r in rows:
         sys.stdout.write(
             f"{r.c:>4}  {r.rows:>6}  {r.binding:<7}  "
-            f"{r.hard_floor_ms:>13.3f}  {r.serial_floor_ms:>15.3f}  "
+            f"{r.hard_floor_ms:>13.3f}  {r.serial_estimate_ms:>18.3f}  "
             f"{r.tpot_floor_ms:>13.3f}  {r.interactivity_ceil_tok_s:>24.1f}  "
             f"{r.output_tput_ceil_per_chip:>25.1f}  {r.flag:<7}\n"
         )

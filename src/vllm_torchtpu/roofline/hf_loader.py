@@ -75,6 +75,10 @@ def _resolve_local_or_hub_url(raw_str: str) -> tuple[dict[str, Any] | None, str]
     if p.is_dir() and (p / "config.json").is_file():
         return dict(json.loads((p / "config.json").read_text())), ""
 
+    if p.is_absolute() or raw_str.endswith(".json") or raw_str.startswith((".", "/")):
+        msg = f"Could not resolve HF config path: {raw_str}"
+        raise FileNotFoundError(msg)
+
     if "/" in raw_str and not raw_str.startswith(("http://", "https://")):
         org_repo = raw_str.strip("/").replace("/", "--")
         roots: list[Path] = []
@@ -119,15 +123,19 @@ def _fetch_remote_hf_config(url: str, token: str) -> dict[str, Any]:
     path = parsed_url.path or "/"
     if parsed_url.query:
         path = f"{path}?{parsed_url.query}"
-    with contextlib.closing(
-        conn_cls(parsed_url.hostname, port=port, timeout=HTTP_TIMEOUT_S)
-    ) as conn:
-        conn.request("GET", path, headers=headers)
-        resp = conn.getresponse()
-        if resp.status != HTTP_OK:
-            msg = f"HTTP {resp.status} fetching HF config from {url}"
-            raise FileNotFoundError(msg)
-        data = resp.read()
+    try:
+        with contextlib.closing(
+            conn_cls(parsed_url.hostname, port=port, timeout=HTTP_TIMEOUT_S)
+        ) as conn:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            if resp.status != HTTP_OK:
+                msg = f"HTTP {resp.status} fetching HF config from {url}"
+                raise FileNotFoundError(msg)
+            data = resp.read()
+    except (TimeoutError, OSError) as exc:
+        msg = f"Network timeout or error fetching HF config from {url}: {exc}"
+        raise RuntimeError(msg) from exc
     return dict(json.loads(data.decode("utf-8")))
 
 
@@ -382,23 +390,20 @@ def _derive_activation_mode(
     """Derive compute activation peak ('a8' vs 'a16') from quantization_config."""
     if qp.act_bits == EIGHT_BITS:
         return "a8"
-    if qp.act_bits == SIXTEEN_BITS:
+    if qp.act_bits == SIXTEEN_BITS or qp.q_method in WEIGHT_ONLY_QUANT_METHODS:
         return "a16"
-    if qp.q_method in WEIGHT_ONLY_QUANT_METHODS:
+    if qcfg.get("weight_only") or ("config_groups" in qcfg and qp.act_bits is None):
         return "a16"
     qcfg_lower = str(qcfg).lower()
     if any(tok in qcfg_lower for tok in ("w4a16", "w8a16")):
         return "a16"
     if (
-        qp.bits == FOUR_BITS
-        and "fp8" not in qp.q_method
-        and "nvfp4" not in qcfg_lower
-        and "mxfp4" not in qcfg_lower
-        and "w4a8" not in qcfg_lower
-        and "a8" not in qcfg_lower
+        "fp8" in qp.q_method
+        or "fp8" in qp.q_algo
+        or any(tok in qcfg_lower for tok in ("nvfp4", "mxfp4", "w4a8", "w8a8", "a8"))
     ):
-        return "a16"
-    return "a8"
+        return "a8"
+    return "a16"
 
 
 def dtypes_from_hf_config(cfg: Mapping[str, Any]) -> Dtypes:

@@ -23,9 +23,16 @@ from .collectives import Algo, Collective, CollectiveConfig, Kind, make, padded_
 from .constants import (
     BF16_BYTES,
     DEFAULT_CORES_PER_CHIP,
+    FP8_BYTES,
+    HBM_MIN_PACKING_DIVISOR,
+    HBM_PACKING_NUMERATOR,
+    HEAD_DIM_PACKING_THRESHOLD,
     LAYER_TYPE_MAP,
     MATMUL_FLOP_PER_MAC,
+    PHYSICAL_ALIGNMENT_ELEMS,
+    SPARSE_MLA_SCALE_BYTES,
 )
+from .geometry import layer_ffn_kinds
 
 if TYPE_CHECKING:
     from .geometry import ModelGeometry
@@ -97,6 +104,8 @@ class ModuleCost:
     collectives: tuple[Collective, ...] = ()
     hbm_bytes_min: float | None = None
     unique_collectives: tuple[tuple[Collective, int], ...] | None = None
+    fp8_flops_min: float | None = None
+    bf16_flops_min: float | None = None
 
     @property
     def ici_bytes(self) -> float:
@@ -121,6 +130,16 @@ class ModuleCost:
     def strict_hbm_bytes(self) -> float:
         """Strict lower-bound HBM bytes when available, else nominal HBM bytes."""
         return self.hbm_bytes if self.hbm_bytes_min is None else self.hbm_bytes_min
+
+    @property
+    def strict_fp8_flops(self) -> float:
+        """Unpadded lower-bound FP8 FLOPs when available, else nominal FP8 FLOPs."""
+        return self.fp8_flops if self.fp8_flops_min is None else self.fp8_flops_min
+
+    @property
+    def strict_bf16_flops(self) -> float:
+        """Unpadded lower-bound BF16 FLOPs when available, else nominal BF16 FLOPs."""
+        return self.bf16_flops if self.bf16_flops_min is None else self.bf16_flops_min
 
 
 def experts_touched(num_experts: int, top_k: int, rows: int) -> float:
@@ -569,6 +588,80 @@ def _count_layer_types(geom: ModelGeometry) -> _ModuleLayerCounts:
     )
 
 
+def _gqa_swa_kv_bytes_per_tok(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    par: Parallel,
+    head_dim: int,
+    *,
+    physical: bool,
+) -> float:
+    """Compute per-token per-layer KV bytes for GQA or SWA head geometry."""
+    tp = max(1, par.tp)
+    kvh = max(1, geom.num_kv_heads // tp) if geom.num_kv_heads > 0 else 0
+    if not physical:
+        return float(2 * kvh * head_dim) * dt.kv
+    kv_packing = max(
+        1,
+        round(HBM_PACKING_NUMERATOR / max(HBM_MIN_PACKING_DIVISOR, dt.kv)),
+    )
+    padded_hd = (
+        math.ceil(head_dim / PHYSICAL_ALIGNMENT_ELEMS) * PHYSICAL_ALIGNMENT_ELEMS
+        if head_dim > 0
+        else 0
+    )
+    kx2 = kvh if head_dim == HEAD_DIM_PACKING_THRESHOLD else 2 * kvh
+    padded_kx2 = math.ceil(kx2 / kv_packing) * kv_packing if kx2 > 0 else 0
+    return float(padded_kx2 * padded_hd) * dt.kv
+
+
+def kv_bytes_per_token_per_layer(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    par: Parallel,
+    layer_type: str = "gqa",
+    *,
+    physical: bool = True,
+) -> float:
+    """Return KV cache bytes stored per token for one layer of given attention type."""
+    resolved = layer_type
+    if resolved in ("full_attention", "attention"):
+        if geom.kv_lora_rank > 0 and geom.index_topk > 0:
+            resolved = "dsa"
+        elif geom.kv_lora_rank > 0:
+            resolved = "mla"
+        else:
+            resolved = "gqa"
+
+    if resolved == "gqa":
+        gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
+        return _gqa_swa_kv_bytes_per_tok(geom, dt, par, gqa_hd, physical=physical)
+    if resolved == "swa":
+        return _gqa_swa_kv_bytes_per_tok(
+            geom, dt, par, geom.head_dim, physical=physical
+        )
+    if resolved in ("mla", "dsa"):
+        raw_latent_w = geom.kv_lora_rank + geom.qk_rope_head_dim
+        latent_w = (
+            math.ceil(raw_latent_w / PHYSICAL_ALIGNMENT_ELEMS)
+            * PHYSICAL_ALIGNMENT_ELEMS
+            if physical
+            else raw_latent_w
+        )
+        mla_latent_b = float(latent_w) * dt.kv
+        has_sparse = (
+            resolved == "dsa" and geom.index_topk > 0 and geom.index_head_dim > 0
+        )
+        idx_scale = SPARSE_MLA_SCALE_BYTES if (physical and dt.kv <= FP8_BYTES) else 0.0
+        dsa_idx_b = (
+            float(geom.index_head_dim) * dt.kv + idx_scale if has_sparse else 0.0
+        )
+        return mla_latent_b + dsa_idx_b
+
+    msg = f"Unknown attention layer type: {layer_type}"
+    raise ValueError(msg)
+
+
 def _compute_gqa_cost(
     geom: ModelGeometry,
     par: Parallel,
@@ -595,7 +688,9 @@ def _compute_gqa_cost(
     gqa_kv_scale = (counts.kv_gqa / float(n_gqa)) if geom.compress_ratios else 1.0
     kv_dec_tokens = float(ctx.batch * ctx.context) * gqa_kv_scale / par.kv_split
     kv_pre_tokens = float(ctx.cached_prefix + ctx.eff_prefill)
-    kv_bytes = float(kvh * gqa_hd * 2) * n_eff * (kv_dec_tokens + kv_pre_tokens) * dt.kv
+    kv_tokens_total = n_eff * (kv_dec_tokens + kv_pre_tokens)
+    b_kv_phys = kv_bytes_per_token_per_layer(geom, dt, par, "gqa", physical=True)
+    b_kv_min = kv_bytes_per_token_per_layer(geom, dt, par, "gqa", physical=False)
     att_fp8, att_bf16 = _split_matmul_flops(ctx.rows, att_w_elems, dt.w_dense, dt.act)
     dec_scores = float(
         ctx.decode_rows * 4 * ctx.context * gqa_hd * (geom.num_heads // tp) * n_eff
@@ -623,10 +718,11 @@ def _compute_gqa_cost(
     )
     return ModuleCost(
         name="gqa",
-        hbm_bytes=att_w_elems * dt.w_dense + kv_bytes,
+        hbm_bytes=att_w_elems * dt.w_dense + kv_tokens_total * b_kv_phys,
         fp8_flops=att_fp8,
         bf16_flops=att_bf16 + dec_scores + pre_scores,
         collectives=att_colls,
+        hbm_bytes_min=att_w_elems * dt.w_dense + kv_tokens_total * b_kv_min,
         unique_collectives=att_ucolls,
     )
 
@@ -659,7 +755,8 @@ def _compute_swa_cost(
     kv_tokens = float(ctx.batch * eff_ctx) / par.kv_split + float(
         min(ctx.cached_prefix + ctx.eff_prefill, sw_cap) if ctx.eff_prefill > 0 else 0
     )
-    swa_kv_bytes = float(kvh * geom.head_dim * 2) * n_eff * kv_tokens * dt.kv
+    b_kv_phys = kv_bytes_per_token_per_layer(geom, dt, par, "swa", physical=True)
+    b_kv_min = kv_bytes_per_token_per_layer(geom, dt, par, "swa", physical=False)
     swa_fp8, swa_bf16 = _split_matmul_flops(ctx.rows, swa_w_elems, dt.w_dense, dt.act)
     swa_scores = float(
         (
@@ -689,10 +786,11 @@ def _compute_swa_cost(
     )
     return ModuleCost(
         name="swa",
-        hbm_bytes=swa_w_elems * dt.w_dense + swa_kv_bytes,
+        hbm_bytes=swa_w_elems * dt.w_dense + n_eff * kv_tokens * b_kv_phys,
         fp8_flops=swa_fp8,
         bf16_flops=swa_bf16 + swa_scores,
         collectives=swa_colls,
+        hbm_bytes_min=swa_w_elems * dt.w_dense + n_eff * kv_tokens * b_kv_min,
         unique_collectives=swa_ucolls,
     )
 
@@ -750,20 +848,35 @@ def _compute_mla_dsa_costs(
             if (is_sparse and geom.index_topk > 0 and ctx.context > 0)
             else ctx.context
         )
-        latent_width = kv_lora + rope_d
+        raw_latent_w = kv_lora + rope_d
+        b_latent_phys = (
+            float(
+                math.ceil(raw_latent_w / PHYSICAL_ALIGNMENT_ELEMS)
+                * PHYSICAL_ALIGNMENT_ELEMS
+            )
+            * dt.kv
+        )
+        b_latent_min = float(raw_latent_w) * dt.kv
+        has_idx = is_sparse and geom.index_topk > 0 and geom.index_head_dim > 0
+        b_idx_phys = (
+            float(geom.index_head_dim) * dt.kv
+            + (SPARSE_MLA_SCALE_BYTES if dt.kv <= FP8_BYTES else 0.0)
+            if has_idx
+            else 0.0
+        )
+        b_idx_min = float(geom.index_head_dim) * dt.kv if has_idx else 0.0
         fam_kv_scale = (kv_n_fam / float(n_fam)) if geom.compress_ratios else 1.0
         kv_tokens = float(ctx.batch * att_ctx) * fam_kv_scale / par.kv_split + float(
             ctx.cached_prefix + ctx.eff_prefill
         )
-        mla_kv_bytes = n_eff * kv_tokens * float(latent_width) * dt.kv
+        mla_kv_bytes = n_eff * kv_tokens * b_latent_phys
+        mla_kv_bytes_min = n_eff * kv_tokens * b_latent_min
         if is_sparse and geom.index_head_dim > 0 and ctx.context > 0:
-            mla_kv_bytes += (
-                n_eff
-                * float(ctx.batch * ctx.context * geom.index_head_dim)
-                * fam_kv_scale
-                * dt.kv
-                / par.kv_split
+            idx_tokens = (
+                n_eff * float(ctx.batch * ctx.context) * fam_kv_scale / par.kv_split
             )
+            mla_kv_bytes += idx_tokens * b_idx_phys
+            mla_kv_bytes_min += idx_tokens * b_idx_min
         mla_fp8, mla_bf16 = _split_matmul_flops(
             ctx.rows, mla_w_elems, dt.w_dense, dt.act
         )
@@ -801,6 +914,7 @@ def _compute_mla_dsa_costs(
                 fp8_flops=mla_fp8,
                 bf16_flops=mla_bf16 + mla_scores,
                 collectives=mla_colls,
+                hbm_bytes_min=mla_w_elems * dt.w_dense + mla_kv_bytes_min,
                 unique_collectives=mla_ucolls,
             )
         )
@@ -976,6 +1090,8 @@ def _compute_routed_moe_cost(
     r_fp8, r_bf16 = _split_matmul_flops(
         routed_rows, routed_act_elems, dt.w_expert, dt.act
     )
+    r_fp8_min = r_fp8
+    r_bf16_min = r_bf16
     if ctx.mxu_m_tile > 1 and routed_rows > 0 and ed > 0.0 and geom.top_k > 0:
         ed_global = (
             experts_touched(geom.num_experts, geom.top_k, routed_rows)
@@ -1011,6 +1127,8 @@ def _compute_routed_moe_cost(
         collectives=moe_colls,
         hbm_bytes_min=moe_w_bytes_min,
         unique_collectives=moe_ucolls,
+        fp8_flops_min=r_fp8_min + s_fp8 + rt_fp8,
+        bf16_flops_min=r_bf16_min + s_bf16 + rt_bf16,
     )
 
 
@@ -1023,58 +1141,25 @@ def _compute_moe_mlp_costs(
     """Compute ModuleCost for dense MLP and routed MoE layers."""
     tp = par.tp
     out: list[ModuleCost] = []
-    if geom.num_experts > 0:
-        n_dense_ffn = min(geom.num_layers, geom.first_k_dense_replace)
-        n_moe_ffn = geom.num_layers - n_dense_ffn
-        if n_dense_ffn > 0 and geom.dense_inter > 0:
-            n_d_eff = n_dense_ffn * ctx.pp_scale
-            mlp_inter = geom.dense_inter // tp
-            mlp_elems = float(n_d_eff * 3 * geom.hidden * mlp_inter)
-            mlp_fp8, mlp_bf16 = _split_matmul_flops(
-                ctx.rows, mlp_elems, dt.w_dense, dt.act
-            )
-            d_par = Parallel(
+    kinds = layer_ffn_kinds(geom)
+    n_moe_ffn = kinds.count("moe")
+    n_dense_ffn = kinds.count("dense")
+    if n_dense_ffn > 0 and geom.dense_inter > 0:
+        n_d_eff = n_dense_ffn * ctx.pp_scale
+        mlp_inter = geom.dense_inter // tp
+        mlp_elems = float(n_d_eff * 3 * geom.hidden * mlp_inter)
+        mlp_fp8, mlp_bf16 = _split_matmul_flops(ctx.rows, mlp_elems, dt.w_dense, dt.act)
+        d_par = (
+            Parallel(
                 tp=par.tp,
                 residual=par.residual,
                 ar_algo=par.ar_algo,
                 ranks_per_chip=par.ranks_per_chip,
                 moe="ep" if par.residual == "sp" else "tp_slice",
             )
-            mlp_colls = _moe_layer_collectives(
-                _MoeLayerSpec(
-                    rows=ctx.rows,
-                    hidden=geom.hidden,
-                    num_experts=0,
-                    top_k=0,
-                    block_parallel=geom.block_parallel,
-                ),
-                d_par,
-            ) * max(1, round(n_d_eff))
-            out.append(
-                ModuleCost(
-                    name="mlp",
-                    hbm_bytes=mlp_elems * dt.w_dense,
-                    fp8_flops=mlp_fp8,
-                    bf16_flops=mlp_bf16,
-                    collectives=mlp_colls,
-                )
-            )
-        if n_moe_ffn > 0:
-            n_m_eff = n_moe_ffn * ctx.pp_scale
-            out.append(
-                _compute_routed_moe_cost(
-                    geom,
-                    par,
-                    dt,
-                    ctx,
-                    n_m_eff=n_m_eff,
-                )
-            )
-    else:
-        n_d_eff = geom.num_layers * ctx.pp_scale
-        mlp_inter = geom.dense_inter // tp
-        mlp_elems = float(n_d_eff * 3 * geom.hidden * mlp_inter)
-        mlp_fp8, mlp_bf16 = _split_matmul_flops(ctx.rows, mlp_elems, dt.w_dense, dt.act)
+            if geom.num_experts > 0
+            else par
+        )
         mlp_colls = _moe_layer_collectives(
             _MoeLayerSpec(
                 rows=ctx.rows,
@@ -1083,7 +1168,7 @@ def _compute_moe_mlp_costs(
                 top_k=0,
                 block_parallel=geom.block_parallel,
             ),
-            par,
+            d_par,
         ) * max(1, round(n_d_eff))
         out.append(
             ModuleCost(
@@ -1092,6 +1177,17 @@ def _compute_moe_mlp_costs(
                 fp8_flops=mlp_fp8,
                 bf16_flops=mlp_bf16,
                 collectives=mlp_colls,
+            )
+        )
+    if n_moe_ffn > 0:
+        n_m_eff = n_moe_ffn * ctx.pp_scale
+        out.append(
+            _compute_routed_moe_cost(
+                geom,
+                par,
+                dt,
+                ctx,
+                n_m_eff=n_m_eff,
             )
         )
     return out

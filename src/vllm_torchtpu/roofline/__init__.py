@@ -15,7 +15,15 @@
 
 from __future__ import annotations
 
-from .chips import CHIPS, TOPOLOGIES, ChipOverrides, ChipSpec, SliceTopology
+from .chips import (
+    CHIPS,
+    TOPOLOGIES,
+    ChipOverrides,
+    ChipSpec,
+    ConstantSpec,
+    SliceTopology,
+    chip_catalog,
+)
 from .collectives import Collective, CollectiveConfig, torus_collective_s
 from .constants import MAX_EMBEDDED_CANDIDATES, SOLVE_SCHEMA
 from .emit import (
@@ -74,6 +82,7 @@ __all__ = [
     "Collective",
     "CollectiveConfig",
     "ConcurrencyRow",
+    "ConstantSpec",
     "Dtypes",
     "FloorOptions",
     "FloorTimes",
@@ -103,6 +112,7 @@ __all__ = [
     "UnsupportedArchitectureError",
     "build_example_scenario",
     "build_solve_payload",
+    "chip_catalog",
     "dtypes_from_hf_config",
     "emit_ceiling_rows",
     "emit_launch_args",

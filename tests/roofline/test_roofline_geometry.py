@@ -20,12 +20,17 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
-from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, ChipOverrides, chips
 from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.partition import count_full_attn_layers
+
+
+def _get_pallas_tpu() -> object:
+    """Import and return jax.experimental.pallas.tpu or skip test."""
+    return pytest.importorskip("jax.experimental.pallas.tpu")
+
 
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
@@ -61,6 +66,7 @@ def test_topologies_exclude_subhost_shapes() -> None:
 
 def test_chip_table_matches_jax_tpu_info() -> None:
     """Verify CHIPS['tpu7x'] parameters exactly match JAX's TPU info table."""
+    pltpu = _get_pallas_tpu()
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     c = CHIPS["tpu7x"]
     assert c.hbm_bytes == info.hbm_capacity_bytes
@@ -411,3 +417,95 @@ def test_ffn_only_hybrid_override_excluded_from_full_attn_count() -> None:
     assert ng.ffn_layer_counts() == (1, 1)
     assert ng.ffn_kinds == ("none", "dense", "none", "none", "none", "moe")
     assert count_full_attn_layers(ng) == 1
+
+
+def test_dcn_per_chip_derives_from_host_bandwidth() -> None:
+    """Verify per-chip DCN bandwidth is derived from host Gbit/s and chip count."""
+    chip = CHIPS["tpu7x"]
+    assert chip.dcn_bw == pytest.approx(12.5e9)
+    low = chips.from_jax(
+        "tpu7x",
+        "tpu7x",
+        ChipOverrides(dcn_host_gbit_per_s=200.0, chips_per_host=4),
+    )
+    high = chips.from_jax(
+        "tpu7x",
+        "tpu7x",
+        ChipOverrides(dcn_host_gbit_per_s=800.0, chips_per_host=4),
+    )
+    assert low.dcn_bw == pytest.approx(6.25e9)
+    assert high.dcn_bw == pytest.approx(25.0e9)
+
+
+def test_every_constant_has_kind_unit_scope_source() -> None:
+    """Verify every catalog constant carries value, unit, scope, kind, and source."""
+    cat = CHIPS["tpu7x"].catalog()
+    expected_kinds = {
+        "hbm_bytes": "fact",
+        "hbm_bw": "fact",
+        "bf16_flops": "fact",
+        "fp8_flops": "fact",
+        "vmem_bytes": "fact",
+        "cores_per_chip": "fact",
+        "ici_link_bw": "derived",
+        "d2d_bw": "derived",
+        "ici_bw": "derived",
+        "dcn_bw": "derived",
+        "ici_hop_latency_s": "assumed",
+        "pcie_bw": "assumed",
+        "mxu_m_tile": "assumed",
+        "dcn_host_gbit_per_s": "assumed",
+        "chips_per_host": "assumed",
+        "page_table_byte_budget": "assumed",
+        "rpa_page_size_tokens": "assumed",
+        "default_gpu_memory_utilization": "config",
+    }
+    for key, exp_kind in expected_kinds.items():
+        assert key in cat, f"missing catalog key {key}"
+        entry = cat[key]
+        assert entry["kind"] == exp_kind
+        assert entry["scope"] in {"core", "chip", "host", "link"}
+        unit = entry["unit"]
+        source = entry["source"]
+        assert isinstance(unit, str)
+        assert bool(unit.strip())
+        assert isinstance(source, str)
+        assert bool(source.strip())
+        assert "value" in entry
+        if exp_kind == "assumed":
+            assert entry["bracket"] is not None
+    assert cat["dcn_bw"]["value"] == pytest.approx(12.5e9)
+    bracket = cat["dcn_bw"]["bracket"]
+    assert isinstance(bracket, tuple)
+    assert list(bracket) == [6.25e9, 25.0e9]
+
+
+def test_second_chip_entry_loads_without_code_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify fallback table entry loads via from_jax without code edits."""
+    synth_hbm_bytes = 34_400_000_000
+    monkeypatch.setitem(
+        chips.FALLBACK_TPU_SPECS,
+        "synth_chip",
+        (synth_hbm_bytes, 1.64e12, 0.918e15, 1.836e15, 134_217_728),
+    )
+    spec = chips.from_jax(
+        "synth_chip",
+        "synth_chip",
+        ChipOverrides(
+            cores_per_chip=1,
+            ici_link_bw=50.0e9,
+            dcn_host_gbit_per_s=200.0,
+            chips_per_host=4,
+        ),
+    )
+    assert spec.name == "synth_chip"
+    assert spec.hbm_bytes == synth_hbm_bytes
+    assert spec.cores_per_chip == 1
+    assert spec.d2d_bw == pytest.approx(300.0e9)
+    assert spec.ici_bw == pytest.approx(300.0e9)
+    assert spec.dcn_bw == pytest.approx(6.25e9)
+    cat = spec.catalog()
+    assert cat["hbm_bytes"]["value"] == synth_hbm_bytes
+    assert cat["dcn_bw"]["value"] == pytest.approx(6.25e9)

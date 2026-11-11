@@ -49,7 +49,7 @@ class ConcurrencyRow:
     rows: int
     binding: str
     hard_floor_ms: float
-    serial_floor_ms: float
+    serial_estimate_ms: float
     tpot_floor_ms: float
     interactivity_ceil_tok_s: float
     output_tput_ceil_per_chip: float
@@ -93,18 +93,18 @@ def plan(
                 opts,
             )
         hard_ms = sf.hard_floor_s * UNIT_MILLIS_PER_SECOND
-        serial_ms = sf.serial_floor_s * UNIT_MILLIS_PER_SECOND
+        serial_ms = sf.serial_estimate_s * UNIT_MILLIS_PER_SECOND
         tpot_ms = hard_ms / tokens
         interactivity = UNIT_MILLIS_PER_SECOND / tpot_ms
         output_tput = (c * tokens) / sf.hard_floor_s / chips
-        flag = "MEASURE" if sf.binding == "chain" else "-"
+        flag = "MEASURE" if sf.binding in ("chain", "ici") else "-"
         rows_out.append(
             ConcurrencyRow(
                 c=c,
                 rows=c * (request.spec_window + 1),
                 binding=sf.binding,
                 hard_floor_ms=hard_ms,
-                serial_floor_ms=serial_ms,
+                serial_estimate_ms=serial_ms,
                 tpot_floor_ms=tpot_ms,
                 interactivity_ceil_tok_s=interactivity,
                 output_tput_ceil_per_chip=output_tput,

@@ -121,13 +121,19 @@ class ModelGeometry:
         return from_hf_config(cfg)
 
     def ffn_layer_counts(self) -> tuple[int, int]:
-        """Return (n_moe_ffn, n_dense_ffn) from ffn_kinds or dense/MoE split."""
-        if self.ffn_kinds:
-            return (self.ffn_kinds.count("moe"), self.ffn_kinds.count("dense"))
-        if self.num_experts > 0:
-            n_dense = min(self.num_layers, self.first_k_dense_replace)
-            return (self.num_layers - n_dense, n_dense)
-        return (0, self.num_layers)
+        """Return (n_moe_ffn, n_dense_ffn) counted from layer_ffn_kinds."""
+        kinds = layer_ffn_kinds(self)
+        return (kinds.count("moe"), kinds.count("dense"))
+
+
+def layer_ffn_kinds(geom: ModelGeometry) -> tuple[str, ...]:
+    """Return per-layer FFN kinds ('dense', 'moe', or 'none') for model geometry."""
+    if geom.ffn_kinds and len(geom.ffn_kinds) == geom.num_layers:
+        return geom.ffn_kinds
+    if geom.num_experts > 0:
+        first_k = min(geom.num_layers, geom.first_k_dense_replace)
+        return ("dense",) * first_k + ("moe",) * (geom.num_layers - first_k)
+    return ("dense",) * geom.num_layers
 
 
 def _validate_text_config(cfg: Mapping[str, object]) -> Mapping[str, object]:

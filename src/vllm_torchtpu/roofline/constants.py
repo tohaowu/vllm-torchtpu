@@ -28,6 +28,23 @@ DEFAULT_ICI_HOP_LATENCY_S: float = 1.0e-6
 DEFAULT_MXU_M_TILE: int = 256
 TPU7X_ICI_LINKS_PER_CHIP: int = 6
 TPU7X_ICI_BIDIR_LINK_BW: float = 200.0e9
+DEFAULT_D2D_BW: float = float(TPU7X_ICI_LINKS_PER_CHIP) * DEFAULT_ICI_LINK_BW
+DEFAULT_DCN_HOST_GBIT_PER_S: float = 400.0
+DEFAULT_CHIPS_PER_HOST: int = 4
+DEFAULT_PCIE_BW: float = 64.0e9
+BITS_PER_BYTE: float = 8.0
+DEFAULT_DCN_BW: float = (DEFAULT_DCN_HOST_GBIT_PER_S * 1.0e9 / BITS_PER_BYTE) / float(
+    DEFAULT_CHIPS_PER_HOST
+)
+ICI_HOP_LATENCY_BRACKET_S: tuple[float, float] = (0.5e-6, 2.0e-6)
+PCIE_BRACKET_BW: tuple[float, float] = (32.0e9, 64.0e9)
+MXU_M_TILE_BRACKET: tuple[float, float] = (128.0, 256.0)
+DCN_BRACKET_GBIT_PER_S: tuple[float, float] = (200.0, 800.0)
+CHIP_COUNT_BRACKET: tuple[float, float] = (4.0, 4.0)
+PAGE_TABLE_BRACKET_BYTES: tuple[float, float] = (262_144.0, 1_048_576.0)
+RPA_PAGE_SIZE_TOKENS: int = 64
+RPA_PAGE_SIZE_BRACKET_TOKENS: tuple[float, float] = (16.0, 64.0)
+GPU_MEM_UTIL_BRACKET: tuple[float, float] = (0.80, 0.95)
 
 # Fallback (hbm_bytes, hbm_bw, bf16_flops, fp8_flops, vmem_bytes) per TensorCore
 # matching jax._src.tpu_info.get_tpu_info_for_chip(ChipVersion.TPU_7X, 1).
@@ -142,8 +159,12 @@ UNIT_MEGA: float = 1.0e6
 UNIT_GIGA: float = 1.0e9
 UNIT_TERA: float = 1.0e12
 UNIT_PETA: float = 1.0e15
+UNIT_MILLI: float = 1.0e-3
 UNIT_MILLIS_PER_SECOND: float = 1.0e3
 UNIT_MICROS_PER_SECOND: float = 1.0e-6
+BIN_KIBI: float = 1024.0
+BIN_MEBI: float = 1048576.0
+PERCENT_SCALE: float = 100.0
 
 # HF config loader & quantization constants.
 FOUR_BITS: int = 4
@@ -152,7 +173,7 @@ SIXTEEN_BITS: int = 16
 WEIGHT_BLOCK_DIM_LEN: int = 2
 FP8_BLOCK_SCALE_BYTES: float = 4.0
 HTTP_OK: int = 200
-HTTP_TIMEOUT_S: int = 15
+HTTP_TIMEOUT_S: float = 10.0
 DEFAULT_HTTP_PORT: int = 80
 DEFAULT_HTTPS_PORT: int = 443
 

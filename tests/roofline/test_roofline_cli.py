@@ -92,7 +92,7 @@ def test_cli_plan_json_schema(
         "rows",
         "binding",
         "hard_floor_ms",
-        "serial_floor_ms",
+        "serial_estimate_ms",
         "tpot_floor_ms",
         "interactivity_ceil_tok_s",
         "output_tput_ceil_per_chip",
@@ -165,7 +165,12 @@ def test_cli_plan_axes_flags(
     assert rc == 0
     mods = json.loads(capsys.readouterr().out)
     total = sum(m["hbm_bytes"] for m in mods)
-    assert total == pytest.approx(4_476_803_544.77, abs=1.0)
+    assert total == pytest.approx(5_168_280_024.77, abs=1.0)
+    by_name = {m["name"]: m for m in mods}
+    logical_total = total - (
+        by_name["gqa"]["hbm_bytes"] - by_name["gqa"]["hbm_bytes_min"]
+    )
+    assert logical_total == pytest.approx(4_476_803_544.77, abs=1.0)
 
 
 def test_plan_requires_acceptance_length_for_spec_window(tmp_path: Path) -> None:

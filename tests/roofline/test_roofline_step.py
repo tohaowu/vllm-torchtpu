@@ -16,10 +16,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import pytest
 
 import vllm_torchtpu.roofline as rf
+
+if TYPE_CHECKING:
+    from pathlib import Path
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
@@ -41,6 +45,7 @@ from vllm_torchtpu.roofline import (
 )
 from vllm_torchtpu.roofline.collectives import submesh_for_group
 from vllm_torchtpu.roofline.modules import experts_touched
+from vllm_torchtpu.roofline.partition import partition_pp_layers
 
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
@@ -103,7 +108,7 @@ def test_hard_floor_is_max_of_resources() -> None:
         StepShape(batch=1, rows_per_seq=1, context=90036),
         FloorOptions(dt=DOC_DTYPES),
     )
-    assert sf.hard_floor_s == max(sf.hbm_s, sf.mm_s, sf.ici_s)
+    assert sf.hard_floor_s == pytest.approx(sf.resource_bound_s, rel=1e-12)
     assert sf.binding == "hbm"
     assert sf.hbm_s == pytest.approx(3_859_025_920 / 3.7e12, rel=1e-12)
     sf_unpad = step_floor(
@@ -189,8 +194,8 @@ def test_chain_term_binds_with_latency() -> None:
         sf0.chain_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
     )
     assert sf1.hard_floor_s == sf0.hard_floor_s
-    assert sf1.serial_floor_s == pytest.approx(
-        sf0.serial_floor_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
+    assert sf1.serial_estimate_s == pytest.approx(
+        sf0.serial_estimate_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
     )
 
 
@@ -464,7 +469,7 @@ def test_pcp_dcp_mutual_exclusion_and_mixed_step() -> None:
         StepShape(batch=16, rows_per_seq=1, context=8192, prefill_tokens=2048),
         opts_fp8,
     )
-    assert sf_mix.serial_floor_s > sf_dec.serial_floor_s * 1.5
+    assert sf_mix.serial_estimate_s > sf_dec.serial_estimate_s * 1.5
 
 
 def test_slice_topology_wraparound_and_d2d_ar_floor() -> None:
@@ -582,9 +587,9 @@ def test_dependent_collectives_latency_bound() -> None:
     )
     assert sf.resource_bound_s < resource_bound_eps
     assert sf.latency_bound_s > 0.0
-    assert sf.hard_floor_s == pytest.approx(sf.latency_bound_s, rel=1e-12)
-    assert sf.hard_floor_s == max(sf.resource_bound_s, sf.latency_bound_s, sf.chain_s)
-    assert sf.binding == "chain"
+    assert sf.hard_floor_s < resource_bound_eps
+    assert sf.latency_assumed_s == pytest.approx(sf.latency_bound_s, rel=1e-12)
+    assert sf.serial_estimate_s >= sf.latency_bound_s
 
 
 def test_mla_and_ple_missing_field_validations() -> None:
@@ -814,3 +819,160 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
         replace(geom_bp, mtp_inter=0), dt, par, seq_layout
     )
     assert bd_mtp2.weights < bd_moe.weights
+
+
+def test_bound_never_exceeds_estimate_across_families() -> None:
+    """Verify cut/unpadded bounds stay <= step resource times and estimates."""
+    chip = CHIPS["tpu7x"]
+    chip_hi = replace(chip, ici_hop_latency_s=100.0e-6)
+    mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 16,
+        "layer_types": ["mla"] * 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "q_lora_rank": 1024,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "intermediate_size": 8192,
+        "vocab_size": 32000,
+    }
+    dense_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+        "vocab_size": 32000,
+    }
+    cases = (
+        (
+            from_hf_config(QWEN35_CFG),
+            Parallel(tp=8, moe="ep", moe_dispatch="ag_ep"),
+            StepShape(batch=8, rows_per_seq=1, context=8192),
+            rf.dtypes_from_hf_config(QWEN35_CFG),
+        ),
+        (
+            from_hf_config(dense_cfg),
+            Parallel(tp=8),
+            StepShape(batch=8, rows_per_seq=1, context=4096),
+            Dtypes(),
+        ),
+        (
+            from_hf_config(mla_cfg),
+            Parallel(tp=8),
+            StepShape(batch=8, rows_per_seq=1, context=4096),
+            Dtypes(kv=1.0),
+        ),
+    )
+    topo = TOPOLOGIES["2x2x1"]
+    for geom, par, shape, dt in cases:
+        sf = step_floor(geom, chip, par, shape, FloorOptions(dt=dt, topology=topo))
+        sf_hi = step_floor(
+            geom, chip_hi, par, shape, FloorOptions(dt=dt, topology=topo)
+        )
+        assert sf.hbm_bound_s <= sf.hbm_s + 1e-12
+        assert sf.mm_bound_s <= sf.mm_s + 1e-12
+        assert sf.coll_bound_s <= sf.chain_s + 1e-12
+        assert sf.hard_floor_s == pytest.approx(
+            max(sf.hbm_bound_s, sf.mm_bound_s, sf.coll_bound_s), rel=1e-12
+        )
+        assert sf.hard_floor_s <= sf.serial_estimate_s + 1e-12
+        assert sf_hi.hard_floor_s == pytest.approx(sf.hard_floor_s, rel=1e-12)
+        if sf.lat_s > 0.0:
+            assert sf_hi.latency_assumed_s > sf.latency_assumed_s
+
+
+def test_single_expert_routing_cannot_beat_bound() -> None:
+    """Verify best-case single-expert routing time at batch 8 is >= hard_floor_s."""
+    geom = from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = rf.dtypes_from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=8, rows_per_seq=1, context=90036)
+    sf = step_floor(
+        geom,
+        chip,
+        Parallel(tp=8),
+        shape,
+        FloorOptions(dt=dt, topology=TOPOLOGIES["2x2x1"]),
+    )
+    single_expert_hbm_s = sum(m.strict_hbm_bytes for m in sf.modules) / chip.hbm_bw
+    assert single_expert_hbm_s == pytest.approx(0.004269709145945946, rel=1e-9)
+    assert single_expert_hbm_s >= sf.hard_floor_s - 1e-15
+    assert sf.mm_bound_s == pytest.approx(6.861009232900433e-05, rel=1e-9)
+
+
+def test_bound_never_exceeds_estimate_without_topology() -> None:
+    """Verify topology=None keeps chain_s and serial_estimate_s above cut bounds."""
+    chip = CHIPS["tpu7x"]
+    par = Parallel(tp=8, ar_algo="two_shot")
+    shape = StepShape(batch=28, rows_per_seq=4, context=0)
+    dense_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+        "vocab_size": 32000,
+    }
+    for cfg in (dense_cfg, QWEN35_CFG):
+        sf = step_floor(
+            from_hf_config(cfg), chip, par, shape, FloorOptions(dt=Dtypes())
+        )
+        assert sf.coll_bound_s <= sf.chain_s
+        assert sf.hard_floor_s <= sf.serial_estimate_s
+
+
+def test_hf_loader_weight_only_and_local_path_fail_closed(tmp_path: Path) -> None:
+    """Verify weight-only quant defaults to a16 and missing local paths fail fast."""
+    dt_ct_w8 = rf.dtypes_from_hf_config(
+        {
+            "torch_dtype": "bfloat16",
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"num_bits": 8, "type": "int"},
+                        "input_activations": None,
+                    }
+                },
+            },
+        }
+    )
+    assert dt_ct_w8.act == "a16"
+    missing_json = tmp_path / "missing" / "config.json"
+    with pytest.raises(FileNotFoundError, match="Could not resolve HF config path"):
+        rf.load_hf_config(str(missing_json), offline=False)
+
+
+def test_partition_pp_layers_rejects_infeasible_disagg_hybrid() -> None:
+    """Verify disagg PP partitioning rejects hybrid models with too few full layers."""
+    hybrid_end_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 6,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "full_attention",
+        ],
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "linear_num_key_heads": 8,
+        "linear_num_value_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+    }
+    geom = from_hf_config(hybrid_end_cfg)
+    with pytest.raises(ValueError, match="full-attention"):
+        partition_pp_layers(geom, Dtypes(), Parallel(tp=1, pp=3), disagg=True)
