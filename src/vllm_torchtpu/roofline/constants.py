@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Physical TPU hardware, torus collective, and architecture taxonomy constants."""
+"""Physical TPU hardware, torus collective, architecture, and dtype constants."""
 
 from __future__ import annotations
 
@@ -95,4 +95,75 @@ LINEAR_ATTENTION_LAYER_TOKENS: frozenset[str] = frozenset(
         "kimi_linear",
         "kda_attention",
     }
+)
+
+LAYER_TYPE_MAP: dict[str, str] = {
+    "mla": "mla",
+    "mla_attention": "mla",
+    "dsa": "dsa",
+    "dsa_attention": "dsa",
+    "sparse_mla": "dsa",
+    "sliding_attention": "swa",
+    "swa": "swa",
+    "sliding_window_attention": "swa",
+    "kda": "kda",
+    "kimi_linear": "kda",
+    "kda_attention": "kda",
+    "linear_attention": "gdn",
+    "gdn": "gdn",
+    "gated_deltanet": "gdn",
+    "mamba": "gdn",
+    "gqa": "gqa",
+}
+
+# Unit scales and math constants.
+ACTIVATION_BYTES_BF16: float = 2.0
+MATMUL_FLOP_PER_MAC: float = 2.0
+UNIT_KILO: float = 1.0e3
+UNIT_MEGA: float = 1.0e6
+UNIT_GIGA: float = 1.0e9
+UNIT_MILLIS_PER_SECOND: float = 1.0e3
+UNIT_MICROS_PER_SECOND: float = 1.0e-6
+
+# HF config loader & quantization constants.
+FOUR_BITS: int = 4
+EIGHT_BITS: int = 8
+SIXTEEN_BITS: int = 16
+WEIGHT_BLOCK_DIM_LEN: int = 2
+FP8_BLOCK_SCALE_BYTES: float = 4.0
+HTTP_OK: int = 200
+HTTP_TIMEOUT_S: int = 15
+DEFAULT_HTTP_PORT: int = 80
+DEFAULT_HTTPS_PORT: int = 443
+
+FP32_BYTES: float = 4.0
+BF16_BYTES: float = 2.0
+FP8_BYTES: float = 1.0
+DEFAULT_SSM_STATE_BYTES: float = 4.0
+MXFP4_BYTES: float = 0.5 + 1.0 / 32.0
+NVFP4_BYTES: float = 0.5 + 1.0 / 16.0
+
+BASE_DTYPE_BYTES: dict[str, float] = {
+    "float32": FP32_BYTES,
+    "fp32": FP32_BYTES,
+    "bfloat16": BF16_BYTES,
+    "bf16": BF16_BYTES,
+    "float16": BF16_BYTES,
+    "fp16": BF16_BYTES,
+    "float8_e4m3fn": FP8_BYTES,
+    "fp8": FP8_BYTES,
+}
+
+WEIGHT_DTYPE_BYTES: dict[str, float] = {"bf16": BF16_BYTES, "fp8": FP8_BYTES}
+EXPERT_DTYPE_BYTES: dict[str, float] = {
+    "bf16": BF16_BYTES,
+    "fp8": FP8_BYTES,
+    "nvfp4": NVFP4_BYTES,
+    "mxfp4": MXFP4_BYTES,
+}
+KV_DTYPE_BYTES: dict[str, float] = {"bf16": BF16_BYTES, "fp8": FP8_BYTES}
+STATE_DTYPE_BYTES: dict[str, float] = {"fp32": FP32_BYTES, "bf16": BF16_BYTES}
+
+WEIGHT_ONLY_QUANT_METHODS: frozenset[str] = frozenset(
+    {"awq", "gptq", "gptq_marlin", "awq_marlin", "bitsandbytes", "hqq", "eetq"}
 )
