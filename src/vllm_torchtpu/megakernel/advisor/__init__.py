@@ -31,6 +31,7 @@ from . import (
     vmem,
     workbench,
     workbench_engine,
+    workbench_phase,
 )
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
@@ -123,6 +124,10 @@ from .vmem import (
     validate_advise_inputs,
 )
 from .workbench_engine import render_workbench_engine_js
+from .workbench_phase import (
+    render_phase_extension_js,
+    render_phase_stage_tab_button,
+)
 
 __all__ = [
     "BUCKET_CONSUMER_STATUS",
@@ -200,6 +205,8 @@ __all__ = [
     "recommend_parallelism",
     "regimes",
     "render_advisor_html",
+    "render_phase_extension_js",
+    "render_phase_stage_tab_button",
     "render_regime_dot_plot_svg",
     "render_workbench_engine_js",
     "report",
@@ -219,6 +226,7 @@ __all__ = [
     "vmem",
     "workbench",
     "workbench_engine",
+    "workbench_phase",
     "write_advisor_html",
     "write_bucket_schedule",
 ]

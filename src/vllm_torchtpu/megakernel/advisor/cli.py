@@ -47,9 +47,11 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
     format_regime_table,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .specs import (
     DispatchRegime,
@@ -322,6 +324,15 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
         dest="deployment_preset",
         help="Ignore deployment presets during regime sweep.",
     )
+    parser.add_argument(
+        "--bucket-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Write advisory advisor.bucket_schedule.v1 JSON schedule to this path "
+            "(or '-' for stdout)"
+        ),
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -517,6 +528,11 @@ def _run_sweep_command(
     sweep = advise_regimes(profile, chip_spec, options=opts)
     if args.html:
         write_advisor_html(sweep, args.html)
+    if args.bucket_schedule is not None:
+        if args.bucket_schedule == "-":
+            _emit_json(build_bucket_schedule(sweep).to_dict(), "-")
+        else:
+            write_bucket_schedule(sweep, args.bucket_schedule)
     if args.json is not None:
         _emit_json(sweep.to_dict(), args.json)
     elif args.regime_sweep:
@@ -589,7 +605,7 @@ def _run_main_command(args: argparse.Namespace) -> int:
     profile, chip_spec = _resolve_cli_model_and_chip(args)
     measurements_val = _resolve_cli_measurements(args.measurements, chip_spec.name)
 
-    if args.regime_sweep or args.html:
+    if args.regime_sweep or args.html or args.bucket_schedule:
         return _run_sweep_command(args, profile, chip_spec, measurements_val)
 
     tp, ep, dp, pp, dcp = _resolve_cli_mesh(args)
