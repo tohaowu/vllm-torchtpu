@@ -447,3 +447,17 @@ COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("alltoall", "all-to-all"),
 )
 PUBLIC_MEASUREMENT_ALIASES: frozenset[str] = frozenset({"bundled", "auto"})
+
+PROVENANCE_TAGS: tuple[str, ...] = ("DERIVED", "ASSUMED", "MEASURED")
+BAND_PAIR_LEN = 2
+MEGAKERNEL_LABELS: Mapping[str, str] = {
+    "whole_step": "WHOLE-STEP MEGAKERNEL",
+    "layer_group": "LAYER-GROUP MEGAKERNEL",
+}
+DECISION_TABLE_COLS = 12
+PHASE_SORT_ORDER: Mapping[str, int] = {
+    "decode": 0,
+    "verify": 1,
+    "mixed": 2,
+    "prefill": 3,
+}

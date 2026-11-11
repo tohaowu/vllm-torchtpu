@@ -70,12 +70,14 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
     format_regime_table,
     render_advisor_html,
     render_regime_dot_plot_svg,
     svg_text_width,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .roofline import validate_workload
 from .spec_bridge import advise_from_spec
@@ -169,6 +171,7 @@ __all__ = [
     "advise_regimes",
     "assets",
     "build_arg_parser",
+    "build_bucket_schedule",
     "calibrate",
     "calibrate_trace",
     "chips",
@@ -211,4 +214,5 @@ __all__ = [
     "verify_chip_spec_against_jax",
     "vmem",
     "write_advisor_html",
+    "write_bucket_schedule",
 ]
