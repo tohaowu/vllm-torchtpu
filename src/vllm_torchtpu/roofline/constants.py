@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Physical TPU hardware, torus collective, architecture, and dtype constants."""
+"""TPU hardware, torus collective, architecture, dtype, and solver constants."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ TOPOLOGY_AXES: dict[str, tuple[int, int, int]] = {
     "4x4x4": (4, 4, 4),
 }
 
-# Transformer layer taxonomy shared across geometry parsing and cost modeling.
+# Transformer layer taxonomy shared across geometry parsing, memory, and cost modeling.
 LAYER_FAMILIES: tuple[str, ...] = (
     "gqa",
     "mla",
@@ -87,6 +87,21 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
 
 LINEAR_ATTENTION_LAYER_TOKENS: frozenset[str] = frozenset(
     {
+        "linear_attention",
+        "gdn",
+        "gated_deltanet",
+        "mamba",
+        "kda",
+        "kimi_linear",
+        "kda_attention",
+    }
+)
+
+NON_FULL_ATTN_TOKENS: frozenset[str] = frozenset(
+    {
+        "sliding_attention",
+        "swa",
+        "sliding_window_attention",
         "linear_attention",
         "gdn",
         "gated_deltanet",
@@ -167,3 +182,26 @@ STATE_DTYPE_BYTES: dict[str, float] = {"fp32": FP32_BYTES, "bf16": BF16_BYTES}
 WEIGHT_ONLY_QUANT_METHODS: frozenset[str] = frozenset(
     {"awq", "gptq", "gptq_marlin", "awq_marlin", "bitsandbytes", "hqq", "eetq"}
 )
+
+# Solver, HBM capacity, and SMEM page-table constants.
+DEFAULT_GPU_MEMORY_UTILIZATION: float = 0.92
+MAX_CTX_TOKENS_FOR_SMALL_PAGE: int = 8192
+PAGE_TABLE_BYTE_BUDGET: int = 524_288
+BYTES_PER_PAGE_ENTRY: int = 4
+MIN_MOE_INTERMEDIATE_ALIGNMENT: int = 128
+RPA_MIN_PAGE_TOKENS: int = 16
+RPA_MAX_PAGE_TOKENS: int = 256
+PHYSICAL_ALIGNMENT_ELEMS: int = 128
+HBM_PACKING_NUMERATOR: float = 4.0
+HBM_MIN_PACKING_DIVISOR: float = 0.5
+SPARSE_MLA_SCALE_BYTES: float = 4.0
+HEAD_DIM_PACKING_THRESHOLD: int = 64
+GLU_MATMUL_COUNT: int = 3
+DEFAULT_MAX_INSTANCES: int = 16
+
+EXAMPLE_CONCURRENCIES: tuple[int, ...] = (1, 4, 8, 16, 32, 64, 128, 256)
+EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
+    "none": (None, None),
+    "interactive": (5000.0, 33.33),
+    "throughput": (5000.0, 66.67),
+}
