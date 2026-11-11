@@ -35,8 +35,10 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_tp_group,
     get_world_group,
     init_distributed_environment,
     model_parallel_is_initialized,
@@ -92,6 +94,14 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+def _model_parallel_ready() -> bool:
+    """Whether vLLM's model-parallel groups exist. torch.distributed can be
+    left open (e.g. by an earlier test) without them."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return False
+    return model_parallel_is_initialized()
 
 
 class TPUWorker(WorkerBase):
@@ -517,16 +527,24 @@ class TPUWorker(WorkerBase):
         each get their own tpu_dist world (see init_device).
         """
         pinned = int(self.cache_config.num_gpu_blocks_override is not None)
-        dist = torch.distributed
-        if (
-            dist.is_available()
-            and dist.is_initialized()
-            and model_parallel_is_initialized()
-        ):
+        if _model_parallel_ready():
             world = get_world_group()
             if world.world_size > 1:
                 pinned = utils.min_over_group(pinned, world.cpu_group)
         return bool(pinned)
+
+    @staticmethod
+    def _min_over_pp_stage(value: int) -> int:
+        """MIN of `value` over the ranks of this worker's pipeline stage: its
+        TP group, then its PCP group, which together cover the stage. Not
+        across stages: they hold different layers, so the same budget is a
+        different block count on each, and the executor reconciles stages
+        separately. Local without model-parallel groups."""
+        if _model_parallel_ready():
+            for group in (get_tp_group(), get_pcp_group()):
+                if group.world_size > 1:
+                    value = utils.min_over_group(value, group.cpu_group)
+        return value
 
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
@@ -584,8 +602,17 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
+        # The ranks of one pipeline stage size the KV cache from the stage's
+        # smallest budget. They can measure different free HBM after the
+        # profile run: under TPU_PRECOMPILE_PEER_REPLAY only a bucket's owner
+        # compiles it, and the compile leaves it holding more HBM than the
+        # ranks that replay the artifact. Compact-mamba sizing derives its
+        # block count from this budget, and the executor rejects counts that
+        # disagree within a stage by more than 0.5% (kv_block_override.py)
+        # while pinning the smallest, so agreeing here changes no block count.
         available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - sum(reserves)
+            self.parallel_config,
+            self._min_over_pp_stage(budget.available - sum(reserves)),
         )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)

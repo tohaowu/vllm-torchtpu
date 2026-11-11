@@ -496,23 +496,40 @@ def test_compact_mamba_kv_cache_is_sized_from_kv_cache_memory_bytes(monkeypatch)
     sizing.assert_called_once_with(3 * utils.GBYTES)
 
 
-def _world(monkeypatch, world_size, peer_pinned=1):
-    """Initialized model parallelism with a world group of `world_size` ranks
-    whose MIN reduce returns at most `peer_pinned`. Returns the groups reduced."""
-    world = SimpleNamespace(world_size=world_size, cpu_group="world")
+def _world(
+    monkeypatch, world_size, peer_pinned=1, tp_size=None, pcp_size=1, budgets=None
+):
+    """Initialized model parallelism: a world group of `world_size` ranks and,
+    within it, a TP group of `tp_size` (default: the whole world) and a PCP
+    group of `pcp_size` ranks. The pinned flag's MIN reduce returns at most
+    `peer_pinned`; a budget reduce over group "world", "tp" or "pcp" returns at
+    most `budgets[group]` (the local value when absent). Returns the groups
+    reduced, in order."""
+    groups = {
+        "world": world_size,
+        "tp": world_size if tp_size is None else tp_size,
+        "pcp": pcp_size,
+    }
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
         "vllm_torchtpu.worker.tpu_worker.model_parallel_is_initialized", lambda: True
     )
-    monkeypatch.setattr(
-        "vllm_torchtpu.worker.tpu_worker.get_world_group", lambda: world
-    )
+    for name in groups:
+        group = SimpleNamespace(world_size=groups[name], cpu_group=name)
+        monkeypatch.setattr(
+            f"vllm_torchtpu.worker.tpu_worker.get_{name}_group",
+            lambda group=group: group,
+        )
+    budgets = budgets or {}
     reduced = []
 
     def all_reduce(t, op, group):
         assert op == torch.distributed.ReduceOp.MIN
         reduced.append(group)
-        t.clamp_(max=peer_pinned)
+        # The pinned flag is 0 or 1; a KV budget is bytes.
+        peer = peer_pinned if t.item() <= 1 else budgets.get(group)
+        if peer is not None:
+            t.clamp_(max=peer)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     return reduced
@@ -556,6 +573,70 @@ def test_kv_cache_size_pinned_without_model_parallel_groups(monkeypatch):
     assert reduced == []
 
 
+@pytest.mark.parametrize("world_size, expected_gb", [(8, 6), (1, 7)])
+def test_determine_available_memory_is_min_across_the_stage(
+    monkeypatch, world_size, expected_gb
+):
+    """Ranks of one stage can measure different free HBM after the profile run
+    (under peer replay only a bucket's owner compiles it and holds more).
+    Compact-mamba sizing turns the budget into a block count the executor
+    requires to agree within a stage, so every rank of the stage sizes from
+    its smallest."""
+    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=local, peer=local
+    )
+    reduced = _world(
+        monkeypatch, world_size=world_size, peer_pinned=0, budgets={"tp": peer}
+    )
+
+    assert worker.determine_available_memory() == expected_gb * utils.GBYTES
+    sizer = worker.model_runner.kv_cache_manager.size_compact_mamba_kv_cache
+    sizer.assert_called_once_with(expected_gb * utils.GBYTES)
+    # On 8 ranks: the pinned check over the world, then the budget over TP.
+    assert reduced == (["world", "tp"] if world_size > 1 else [])
+
+
+def test_determine_available_memory_is_min_across_tp_and_pcp(monkeypatch):
+    """TP and PCP groups together cover a stage: a PCP peer's smaller budget
+    reaches every rank."""
+    local = 7 * utils.GBYTES
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=local, peer=local
+    )
+    reduced = _world(
+        monkeypatch,
+        world_size=8,
+        peer_pinned=0,
+        tp_size=4,
+        pcp_size=2,
+        budgets={"pcp": 5 * utils.GBYTES},
+    )
+
+    assert worker.determine_available_memory() == 5 * utils.GBYTES
+    assert reduced == ["world", "tp", "pcp"]
+
+
+def test_determine_available_memory_keeps_each_pp_stage_budget(monkeypatch):
+    """PP stages hold different layers, so the same bytes are a different block
+    count on each; the executor reconciles stages separately. A smaller budget
+    on the other stage (here "world" spans both) must not shrink this one."""
+    local = 7 * utils.GBYTES
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=local, peer=local
+    )
+    reduced = _world(
+        monkeypatch,
+        world_size=8,
+        peer_pinned=0,
+        tp_size=4,
+        budgets={"world": 3 * utils.GBYTES, "tp": local},
+    )
+
+    assert worker.determine_available_memory() == local
+    assert reduced == ["world", "tp"]
+
+
 def test_determine_available_memory_profiles_when_a_peer_is_not_pinned(
     monkeypatch,
 ):
@@ -571,7 +652,8 @@ def test_determine_available_memory_profiles_when_a_peer_is_not_pinned(
     worker.model_runner.profile_run.assert_called_once_with(
         worker.model_runner.max_num_tokens
     )
-    assert reduced == ["world"]
+    # The pinned check over the world, then the KV budget over the stage.
+    assert reduced == ["world", "tp"]
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")
