@@ -436,3 +436,80 @@ def test_charts_and_bucket_schedule_use_recommended_not_hypothetical() -> None:
     assert sched.buckets
     decode_rule = next(b for b in sched.buckets if b.phase == "decode")
     assert decode_rule.step_bound_us > 0.0
+
+
+QWEN35_COMPARISON_WORKLOAD = advisor.WorkloadSpec(
+    phase="decode", batch=16, context=4096, objective="both"
+)
+
+
+@pytest.mark.parametrize(
+    ("chip", "layout", "expected_chips"),
+    [
+        # TPU v7x exposes 2 devices per chip, so chips = mesh devices / 2.
+        ("tpu7x", advisor.ParallelLayout(tp=8, ep=8, dcp=4), 4),
+        ("tpu7x", advisor.ParallelLayout(tp=2, ep=8, dp=4), 4),
+        ("tpu7x", advisor.ParallelLayout(tp=8, ep=8, dp=2, dcp=4), 8),
+        ("tpu7x", advisor.ParallelLayout(tp=16, ep=16), 8),
+        ("tpu7x", advisor.ParallelLayout(tp=1, ep=32, dcp=32), 16),
+        ("tpu7x", advisor.ParallelLayout(tp=1, ep=1, pp=8), 4),
+        ("tpu7x", advisor.ParallelLayout(tp=8, ep=8, pcp=2), 8),
+        # TPU v6e exposes 1 device per chip, so chips = mesh devices.
+        ("v6e", advisor.ParallelLayout(tp=8, ep=8), 8),
+    ],
+)
+def test_layout_comparison_rows_print_chips(
+    chip: str, layout: advisor.ParallelLayout, expected_chips: int
+) -> None:
+    """Every layout comparison row carries the physical chip count of its mesh."""
+    reference = advisor.ParallelLayout(tp=8, ep=8)
+    result = advisor.compare_parallelism_candidates(
+        "qwen3.5-397b",
+        (reference, layout),
+        chip=chip,
+        base_workload=QWEN35_COMPARISON_WORKLOAD,
+    )
+    rows = result["candidates"]
+    assert isinstance(rows, list)
+    assert [row["layout"] for row in rows] == [reference.label(), layout.label()]
+    assert rows[1]["chips"] == expected_chips
+    assert all(isinstance(row["chips"], int) and row["chips"] >= 1 for row in rows)
+
+
+@pytest.mark.parametrize("objective", ["step", "both", "throughput"])
+def test_step_ranking_rejects_unequal_chip_layouts(objective: str) -> None:
+    """Step time is never ranked across layouts that use different chip counts."""
+    base = dataclasses.replace(QWEN35_COMPARISON_WORKLOAD, objective=objective)
+    four_chips = advisor.ParallelLayout(tp=8, ep=8)
+    eight_chips = advisor.ParallelLayout(tp=16, ep=16)
+    unequal = advisor.compare_parallelism_candidates(
+        "qwen3.5-397b", (four_chips, eight_chips), chip="tpu7x", base_workload=base
+    )
+    rows = unequal["candidates"]
+    assert isinstance(rows, list)
+    assert all(bool(row["hbm_fits"]) and bool(row["valid"]) for row in rows)
+    assert unequal["best_step_layout"] == ""
+    best_per_chip = max(rows, key=lambda row: row["throughput_tok_s_per_chip"])
+    assert unequal["best_throughput_layout"] == best_per_chip["layout"]
+    if objective == "throughput":
+        assert unequal["verdict"] == unequal["best_throughput_layout"]
+    else:
+        assert unequal["verdict"] == "not comparable"
+    assert [row["chips"] for row in rows] == [4, 8]
+
+    # Equal chip counts keep the step ranking.
+    equal = advisor.compare_parallelism_candidates(
+        "qwen3.5-397b",
+        (
+            advisor.ParallelLayout(tp=8, ep=8, dcp=4),
+            advisor.ParallelLayout(tp=2, ep=8, dp=4),
+        ),
+        chip="tpu7x",
+        base_workload=base,
+    )
+    equal_rows = equal["candidates"]
+    assert isinstance(equal_rows, list)
+    assert all(bool(row["hbm_fits"]) and bool(row["valid"]) for row in equal_rows)
+    fastest = min(equal_rows, key=lambda row: row["step_floor_us"])
+    assert equal["best_step_layout"] == fastest["layout"]
+    assert equal["verdict"] != "not comparable"
