@@ -1524,3 +1524,101 @@ def test_no_private_underscore_module_constants() -> None:
             ):
                 offenders.append(f"{py_path.name}:{node.target.id}")
     assert offenders == []
+
+
+NO_LAYER_GROUPING_REASON = (
+    "No layer grouping: needs a model preset, pp > 1, or segment_layers"
+)
+QWEN35_397B_GROUPS_OF_8 = (8, 8, 8, 8, 8, 8, 8, 4)
+QWEN35_SEGMENT_LAYERS = 15
+DECLARED_ROW_LIMIT = 80
+# 32 requests x 4 verify rows = 128 rows; ceil(128 / 80) = 2 calls.
+VERIFY_ROWS_B32_K3 = 128
+CALLS_AT_ROW_LIMIT = 2
+
+
+@pytest.mark.parametrize(
+    "grouping",
+    [
+        {"layer_groups": QWEN35_397B_GROUPS_OF_8},
+        {"segment_layers": QWEN35_SEGMENT_LAYERS},
+        {"pp": 2},
+    ],
+    ids=["layer_groups", "segment_layers", "pp2"],
+)
+def test_layer_group_infeasible_without_declared_grouping(
+    grouping: dict[str, object],
+) -> None:
+    """layer_group is infeasible with no grouping and feasible once one is declared."""
+    prof = advisor.resolve_model_profile("qwen3.5-397b")
+    base = advisor.WorkloadSpec(
+        phase="decode", batch=16, context=4096, tp=8, dcp=4, ep=8
+    )
+    ungrouped = advisor.advise(prof, base, "tpu7x")
+    ungrouped_scope = next(s for s in ungrouped.scopes if s.scope == "layer_group")
+    assert ungrouped_scope.feasible is False
+    assert ungrouped_scope.reason == NO_LAYER_GROUPING_REASON
+
+    grouped = advisor.advise(prof, dataclasses.replace(base, **grouping), "tpu7x")
+    grouped_scope = next(s for s in grouped.scopes if s.scope == "layer_group")
+    assert grouped_scope.feasible is True
+    assert grouped_scope.reason != NO_LAYER_GROUPING_REASON
+
+
+@pytest.mark.parametrize(
+    "layer_groups", [(), QWEN35_397B_GROUPS_OF_8], ids=["ungrouped", "groups_of_8"]
+)
+def test_max_rows_per_call_caps_whole_step_only(
+    layer_groups: tuple[int, ...],
+) -> None:
+    """max_rows_per_call lowers whole_step rows per call; other scopes stay as is."""
+    prof = advisor.resolve_model_profile("qwen3.5-397b")
+    uncapped_wl = advisor.WorkloadSpec(
+        phase="verify",
+        batch=32,
+        spec_tokens=3,
+        context=32768,
+        tp=8,
+        dcp=4,
+        ep=8,
+        layer_groups=layer_groups,
+    )
+    capped_wl = dataclasses.replace(uncapped_wl, max_rows_per_call=DECLARED_ROW_LIMIT)
+    uncapped = {s.scope: s for s in advisor.advise(prof, uncapped_wl, "tpu7x").scopes}
+    capped_rep = advisor.advise(prof, capped_wl, "tpu7x")
+    capped = {s.scope: s for s in capped_rep.scopes}
+
+    assert uncapped["whole_step"].t_vmem_max > DECLARED_ROW_LIMIT
+    assert capped["whole_step"].t_vmem_max == DECLARED_ROW_LIMIT
+    assert capped_rep.active_tokens == VERIFY_ROWS_B32_K3
+    assert capped["whole_step"].n_splits == CALLS_AT_ROW_LIMIT
+    assert capped["whole_step"].n_splits > uncapped["whole_step"].n_splits
+    for scope in ("per_op", "single_layer", "layer_group"):
+        assert capped[scope].t_vmem_max == uncapped[scope].t_vmem_max
+        assert capped[scope].n_splits == uncapped[scope].n_splits
+        assert capped[scope].step_bound_us == uncapped[scope].step_bound_us
+        assert capped[scope].feasible == uncapped[scope].feasible
+
+
+def test_advise_both_objective_keeps_not_comparable() -> None:
+    """advise() reports the layout comparison when the chip counts differ."""
+    # TP16 x EP16 needs 8 chips; the DP4 x TP2 x EP8 saturation preset needs 4.
+    workload = advisor.WorkloadSpec(
+        phase="decode", batch=16, context=4096, tp=16, ep=16, objective="both"
+    )
+    rep = advisor.advise("qwen3.5-397b", workload, "tpu7x")
+    assert "layout_not_comparable" in rep.flags
+    assert "objective_split" not in rep.flags
+    assert (
+        "; step not comparable: TP16 x EP16 uses 8 chips, DP4 x TP2 x EP8 uses "
+        "4 chips; best_throughput_layout=DP4 x TP2 x EP8"
+    ) in rep.rationale
+    # The fusion-scope verdict matches the step objective, which skips the layout check.
+    step_rep = advisor.advise(
+        "qwen3.5-397b", dataclasses.replace(workload, objective="step"), "tpu7x"
+    )
+    assert (rep.verdict, rep.fastest_verdict, rep.recommended_scope) == (
+        step_rep.verdict,
+        step_rep.fastest_verdict,
+        step_rep.recommended_scope,
+    )
