@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from math import ceil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from . import roofline, vmem
 from .chips import ChipSpec, resolve_chip_spec
@@ -1069,6 +1069,24 @@ def _resolve_throughput_and_divisibility(
                     if rec_scope == fastest_scope:
                         verdict = comp_verdict
                     rationale += f"; {comp_verdict}"
+                elif eff_wl.objective == "both" and comp_verdict == "not comparable":
+                    # Chip counts differ: flag it, keep the fusion-scope verdict.
+                    not_comp_flag: str = "layout_not_comparable"
+                    flags = (*flags, not_comp_flag)
+                    cur_row, preset_row = cast(
+                        "list[dict[str, object]]", comp["candidates"]
+                    )
+                    cur_label, cur_chips = cur_row["layout"], cur_row["chips"]
+                    preset_label, preset_chips = (
+                        preset_row["layout"],
+                        preset_row["chips"],
+                    )
+                    best = comp["best_throughput_layout"]
+                    rationale += (
+                        f"; step not comparable: {cur_label} uses {cur_chips} chips, "
+                        f"{preset_label} uses {preset_chips} chips; "
+                        f"best_throughput_layout={best}"
+                    )
                 elif eff_wl.objective == "throughput":
                     rationale += (
                         f"; best_throughput_layout={comp['best_throughput_layout']}"
@@ -1122,9 +1140,13 @@ def compare_parallelism_candidates(
         valid = not _mesh_divisibility_reasons(prof, wl, chip_spec)
         step_us = float(rep.metrics["step_floor_us"]["value"])
         tput = float(rep.metrics["throughput_tok_s_per_chip"]["value"])
+        eff_tp = max(layout.tp, layout.dcp) if layout.tp == 1 else layout.tp
+        mesh_cores = eff_tp * layout.dp * layout.pp * layout.pcp
+        chips = max(1, ceil(mesh_cores / chip_spec.devices_per_chip))
         rows.append(
             {
                 "layout": layout.label(),
+                "chips": chips,
                 "step_floor_us": step_us,
                 "throughput_tok_s_per_chip": tput,
                 "recommended_scope": rep.recommended_scope,
@@ -1152,12 +1174,17 @@ def compare_parallelism_candidates(
     best_tput = max(
         feasible_rows, key=lambda r: float(str(r["throughput_tok_s_per_chip"]))
     )
-    step_lbl = str(best_step["layout"])
+    # Rank step time only at one chip count: a faster step bought with more chips
+    # is not a better layout.
+    equal_chips = len({r["chips"] for r in feasible_rows}) == 1
+    step_lbl = str(best_step["layout"]) if equal_chips else ""
     tput_lbl = str(best_tput["layout"])
-    if objective == "step":
-        verdict = step_lbl
-    elif objective == "throughput":
+    if objective == "throughput":
         verdict = tput_lbl
+    elif not equal_chips:
+        verdict = "not comparable"
+    elif objective == "step":
+        verdict = step_lbl
     elif step_lbl != tput_lbl:
         verdict = f"tie(objective_split: step={step_lbl}, throughput={tput_lbl})"
     else:
